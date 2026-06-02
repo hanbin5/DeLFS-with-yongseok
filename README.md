@@ -1,1 +1,1 @@
-Source code and test scripts for DeLFS published in USENIX OSDI'26
+DeLFS: A Decentralized Log-Structured File System for Manycores
