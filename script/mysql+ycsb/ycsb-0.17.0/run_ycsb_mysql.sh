@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-YCSB_DIR="/mnt/delfs/benchmark/mysql+ycsb/ycsb-0.17.0"
+YCSB_DIR="./"
 WORKLOAD="workloada"
 THREADS=128
 DB_URL="jdbc:mysql://127.0.0.1:3306/ycsb"

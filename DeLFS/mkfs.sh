@@ -1,6 +1,6 @@
 usage() {
-    echo "사용법: $0 <nvme-number>"
-    echo "예시: $0 0   # -> /dev/nvme0n1p1 을 사용"
+    echo "사용법: $0 <nvme-name>"
+    echo "예시: $0 nvme0n1p1  # -> /dev/nvme0n1p1 을 사용"
     exit 1
 }
 
@@ -11,7 +11,7 @@ fi
 
 DEVNUM="$1"
 
-DEVICE="/dev/nvme${DEVNUM}n1p1"
+DEVICE="/dev/${DEVNUM}"
 #DEVICE="/dev/md${DEVNUM}"
 #DEVICE="/dev/nvme${DEVNUM}n1"
 
