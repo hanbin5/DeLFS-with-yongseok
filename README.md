@@ -5,6 +5,7 @@ This repository contains the DeLFS source code, comparison file systems, formatt
 ## Contents
 
 - [Repository structure](#repository-structure)
+- [Team VM environment guide](env-guide/README.md)
 - [Build and install DeLFS](#build-and-install-delfs)
 - [Run the benchmarks](#run-the-benchmarks)
 
@@ -18,6 +19,9 @@ DeLFS/
 ├── DeLFS-CrashMonkey/
 ├── DeLFS-Git-Aging-Benchmark/
 ├── delfs-mkfs/
+├── env-guide/
+│   ├── README.md
+│   └── scripts/
 ├── F2FSJ/
 │   ├── f3fsj-6.6.8/
 │   ├── f3fsj-6.6.8-SC/
@@ -39,6 +43,8 @@ DeLFS/
 Each configuration under `F2FSJ/` contains `linux-6.6.8/` and `module_f3fsj/`. Each configuration under `ScaleCache/` and `ScaleLFS/` contains `linux-6.6.8/` and `module_f3fs/`.
 
 The commands below start from the repository root unless stated otherwise.
+
+For the team's development and test VM setup, including the scaled benchmarks for a 20 GB nvme-loop device, follow the [environment guide](env-guide/README.md). It uses the profiles and workloads in `script/` with the runners in `env-guide/scripts/`.
 
 ## Build and install DeLFS
 
