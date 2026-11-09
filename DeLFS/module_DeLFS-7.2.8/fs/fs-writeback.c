@@ -154,6 +154,28 @@ static long df_wb_writeback(struct bdi_writeback *wb,
  * bit when it starts and clears it when it ends.  With dflush many threads
  * write back the same wb at once, so wb->nr_threads counts them.  The first
  * one sets the bit and the last one clears it.
+ *
+ * Known limitation (from 6.6.8 DeLFS, not fixed): the bit can be clear while
+ * dflush threads are still running.
+ * - The flusher's wb_do_writeback() sets and clears the bit without looking
+ *   at nr_threads, so when it ends it clears the bit under running dflush
+ *   threads.
+ * - Between threads: A's atomic_dec_and_test() hits 0, then B's
+ *   atomic_inc_return() returns 1 and B sets the bit, then A's clear_bit()
+ *   clears B's bit.
+ * The bit is only read through writeback_in_progress(): balance_dirty_pages()
+ * wakes the flusher when it is clear, and skip_if_busy in
+ * try_to_writeback_inodes_sb() skips queueing work when it is set.  So a
+ * wrong clear bit only causes extra flusher wakeups or extra queued work; no
+ * dirty data is lost or skipped.
+ * Measured (dflush-probe.sh): with 4 writers the bit was clear in 43-49% of
+ * calls just before the decrement, with 1 writer in 0.1-0.3%.  Even with 1
+ * writer the flusher ran 1.3k-12.6k times (stock f2fs: 453), so the extra
+ * runs come mostly from the bit being clear between dflush calls, not from
+ * these races.
+ * A fix needs a kernel patch: wb_do_writeback() must clear the bit only when
+ * nr_threads is 0, and the dec/clear vs inc/set pair must be made atomic
+ * (e.g. under a lock).
  */
 static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages)
 {

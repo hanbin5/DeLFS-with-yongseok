@@ -122,7 +122,9 @@ struct bdi_writeback {
 	/*
 	 * DeLFS dflush: number of threads currently running writeback on this
 	 * wb (flusher-style dflush from application threads).  The first one
-	 * sets WB_writeback_running, the last one clears it.
+	 * sets WB_writeback_running, the last one clears it.  Not exact: the
+	 * flusher and a dec/inc race can still clear it early; see
+	 * df_wb_do_writeback_limited() in the DeLFS module.
 	 */
 	atomic_t nr_threads;
 	struct percpu_counter stat[NR_WB_STAT_ITEMS];
