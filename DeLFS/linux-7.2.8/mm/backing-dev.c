@@ -830,6 +830,7 @@ struct bdi_writeback *wb_get_create(struct backing_dev_info *bdi,
 
 	return wb;
 }
+EXPORT_SYMBOL_GPL(wb_get_create);	/* DeLFS dflush */
 
 static int cgwb_bdi_init(struct backing_dev_info *bdi)
 {

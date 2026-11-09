@@ -119,6 +119,12 @@ struct bdi_writeback {
 	spinlock_t list_lock;		/* protects the b_* lists */
 
 	atomic_t writeback_inodes;	/* number of inodes under writeback */
+	/*
+	 * DeLFS dflush: number of threads currently running writeback on this
+	 * wb (flusher-style dflush from application threads).  The first one
+	 * sets WB_writeback_running, the last one clears it.
+	 */
+	atomic_t nr_threads;
 	struct percpu_counter stat[NR_WB_STAT_ITEMS];
 
 	unsigned long bw_time_stamp;	/* last time write bw is updated */

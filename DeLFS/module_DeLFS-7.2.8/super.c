@@ -5681,12 +5681,12 @@ static int f2fs_init_fs_context(struct fs_context *fc)
 
 static struct file_system_type f2fs_fs_type = {
 	.owner		= THIS_MODULE,
-	.name		= "f2fs",
+	.name		= "delfs",	/* DeLFS: was "f2fs" */
 	.init_fs_context = f2fs_init_fs_context,
 	.kill_sb	= kill_f2fs_super,
 	.fs_flags	= FS_REQUIRES_DEV | FS_ALLOW_IDMAP,
 };
-MODULE_ALIAS_FS("f2fs");
+MODULE_ALIAS_FS("delfs");
 
 static int __init init_inodecache(void)
 {

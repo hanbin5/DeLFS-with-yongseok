@@ -3246,8 +3246,16 @@ out:
 		folio_clear_f2fs_gcing(folio);
 	}
 	folio_unlock(folio);
+	/*
+	 * DeLFS dflush: do not run foreground balance/GC while a writer holds
+	 * this inode's i_rwsem.  With dflush, writeback is run by application
+	 * threads, and GC here can wait on inode locks or a checkpoint, which
+	 * can hang while i_rwsem is held.  The writer's deferred dflush runs
+	 * after inode_unlock(), so balancing still happens there.
+	 */
 	if (!S_ISDIR(inode->i_mode) && !IS_NOQUOTA(inode) &&
-			!F2FS_I(inode)->wb_task && allow_balance)
+			!F2FS_I(inode)->wb_task && allow_balance &&
+			!rwsem_is_locked(&inode->i_rwsem))
 		f2fs_balance_fs(sbi, need_balance_fs);
 
 	if (unlikely(f2fs_cp_error(sbi))) {

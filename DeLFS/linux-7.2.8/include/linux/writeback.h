@@ -355,6 +355,40 @@ int balance_dirty_pages_ratelimited_flags(struct address_space *mapping,
 
 bool wb_over_bg_thresh(struct bdi_writeback *wb);
 
+/*
+ * DeLFS dflush: the module runs its own copy of wb_writeback() from
+ * application threads.  It needs the work descriptor and the static helpers
+ * below, so they are made public here (defined in fs/fs-writeback.c).
+ * Keeping the struct in a header means the module and the kernel always
+ * agree on its layout.
+ */
+/*
+ * Passed into wb_writeback(), essentially a subset of writeback_control
+ */
+struct wb_writeback_work {
+	long nr_pages;
+	struct super_block *sb;
+	enum writeback_sync_modes sync_mode;
+	unsigned int tagged_writepages:1;
+	unsigned int for_kupdate:1;
+	unsigned int range_cyclic:1;
+	unsigned int for_background:1;
+	unsigned int for_sync:1;	/* sync(2) WB_SYNC_ALL writeback */
+	unsigned int auto_free:1;	/* free on completion */
+	enum wb_reason reason;		/* why was writeback initiated? */
+
+	struct list_head list;		/* pending work list */
+	struct wb_completion *done;	/* set if the caller waits */
+};
+
+void wb_queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
+	      unsigned long dirtied_before);
+long writeback_sb_inodes(struct super_block *sb, struct bdi_writeback *wb,
+			 struct wb_writeback_work *work);
+long __writeback_inodes_wb(struct bdi_writeback *wb,
+			   struct wb_writeback_work *work);
+void inode_sleep_on_writeback(struct inode *inode);
+
 struct folio *writeback_iter(struct address_space *mapping,
 		struct writeback_control *wbc, struct folio *folio, int *error);
 
