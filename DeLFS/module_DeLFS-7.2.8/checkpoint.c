@@ -1547,8 +1547,14 @@ void f2fs_wait_on_all_pages(struct f2fs_sb_info *sbi, int type)
 
 		if (type == F2FS_DIRTY_META)
 			f2fs_sync_meta_pages(sbi, LONG_MAX, FS_CP_META_IO);
-		else if (type == F2FS_WB_CP_DATA)
+		else if (type == F2FS_WB_CP_DATA) {
 			f2fs_submit_merged_write(sbi, DATA);
+			/*
+			 * DeLFS per-core bio: 6.6.8 DeLFS also submits the NODE
+			 * bios here.  Why is not confirmed yet.
+			 */
+			f2fs_submit_merged_write(sbi, NODE);
+		}
 
 		prepare_to_wait(&sbi->cp_wait, &wait, TASK_UNINTERRUPTIBLE);
 		io_schedule_timeout(DEFAULT_SCHEDULE_TIMEOUT);

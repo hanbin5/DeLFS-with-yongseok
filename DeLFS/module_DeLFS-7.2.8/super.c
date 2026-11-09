@@ -2089,8 +2089,7 @@ static void f2fs_put_super(struct super_block *sb)
 	fscrypt_free_dummy_policy(&F2FS_OPTION(sbi).dummy_enc_policy);
 	destroy_percpu_info(sbi);
 	f2fs_destroy_iostat(sbi);
-	for (i = 0; i < NR_PAGE_TYPE; i++)
-		kfree(sbi->write_io[i]);
+	f2fs_destroy_write_merge_io(sbi);	/* DeLFS per-core bio */
 #if IS_ENABLED(CONFIG_UNICODE)
 	utf8_unload(sb->s_encoding);
 #endif
@@ -5556,8 +5555,7 @@ free_percpu:
 free_iostat:
 	f2fs_destroy_iostat(sbi);
 free_bio_info:
-	for (i = 0; i < NR_PAGE_TYPE; i++)
-		kfree(sbi->write_io[i]);
+	f2fs_destroy_write_merge_io(sbi);	/* DeLFS per-core bio */
 
 #if IS_ENABLED(CONFIG_UNICODE)
 	utf8_unload(sb->s_encoding);
