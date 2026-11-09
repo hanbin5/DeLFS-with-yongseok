@@ -3570,6 +3570,10 @@ next:
 	return ret;
 }
 
+/*
+ * DeLFS serialization-free: no longer called.  __f2fs_write_data_pages()
+ * does not take sbi->writepages any more.  Kept as in 6.6.8 DeLFS.
+ */
 static inline bool __should_serialize_io(struct inode *inode,
 					struct writeback_control *wbc)
 {
@@ -3624,7 +3628,6 @@ static int __f2fs_write_data_pages(struct address_space *mapping,
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct blk_plug plug;
 	int ret;
-	bool locked = false;
 
 	/* skip writing if there is no dirty page in this inode */
 	if (!get_dirty_pages(inode) && wbc->sync_mode == WB_SYNC_NONE)
@@ -3656,11 +3659,13 @@ static int __f2fs_write_data_pages(struct address_space *mapping,
 		goto skip_write;
 	}
 
-	if (__should_serialize_io(inode, wbc)) {
-		mutex_lock(&sbi->writepages);
-		locked = true;
-	}
-
+	/*
+	 * DeLFS serialization-free: do not take the fs-wide sbi->writepages
+	 * mutex here.  It only keeps blocks of different files from mixing in
+	 * a segment (lower GC cost); it is not needed for consistency.  With
+	 * dflush, many writer threads run writeback and would queue on it.
+	 * Compressed files are not serialized either, as in 6.6.8 DeLFS.
+	 */
 	account_writeback(inode, true);
 
 	blk_start_plug(&plug);
@@ -3668,9 +3673,6 @@ static int __f2fs_write_data_pages(struct address_space *mapping,
 	blk_finish_plug(&plug);
 
 	account_writeback(inode, false);
-
-	if (locked)
-		mutex_unlock(&sbi->writepages);
 
 	if (wbc->sync_mode == WB_SYNC_ALL)
 		atomic_dec(&sbi->wb_sync_req[DATA]);
