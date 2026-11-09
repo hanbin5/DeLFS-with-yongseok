@@ -6,9 +6,8 @@
  * fs/fs-writeback.c with the DeLFS changes on top:
  *   - tracepoints removed (the module cannot call the kernel's
  *     writeback tracepoints);
- *   - after filling b_io, stop if the wb already dropped below the
- *     background threshold.  Several writers run this at the same time, so
- *     another one may already have written enough.
+ *   - the 6.6.8 DeLFS re-check of the background threshold after filling
+ *     b_io is not ported (see the comment in the loop).
  *
  * The kernel patch (DeLFS/linux-7.2.8) exports what this file needs:
  * struct wb_writeback_work (moved to <linux/writeback.h>), wb_queue_io()
@@ -94,21 +93,17 @@ static long df_wb_writeback(struct bdi_writeback *wb,
 		}
 
 		/*
-		 * DeLFS: other dflush threads may have brought the wb below
-		 * the background threshold meanwhile.  Stop if so.
-		 *
-		 * 6.6.8 DeLFS did this check with wb->list_lock held.  For a
-		 * memcg wb (cgroup v2), wb_over_bg_thresh() reads memcg stats
-		 * and may flush them, which can sleep.  Sleeping under a
-		 * spinlock is a bug, so the check is done with the lock
-		 * dropped.  The decision is the same.
+		 * DeLFS: 6.6.8 DeLFS re-checked wb_over_bg_thresh() here, with
+		 * wb->list_lock held, so a writer stops once others have brought
+		 * the wb below the background threshold.  It is not ported:
+		 * - the loop-top check already does this; only wb_queue_io(),
+		 *   which writes nothing, runs in between;
+		 * - it can sleep (memcg stats flush on cgroup v2), so it cannot
+		 *   run under the spinlock, and dropping the lock for it lets
+		 *   another thread empty b_io in the meantime.
+		 * Measured with the lock-dropped re-check (4 writers,
+		 * dflush-probe.sh): it stopped the loop 4 times in ~3,650 calls.
 		 */
-		if (work->for_background) {
-			spin_unlock(&wb->list_lock);
-			if (!wb_over_bg_thresh(wb))
-				break;
-			spin_lock(&wb->list_lock);
-		}
 
 		if (work->sb)
 			progress = writeback_sb_inodes(work->sb, wb, work);
