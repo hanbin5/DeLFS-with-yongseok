@@ -1,2 +1,0 @@
-# Keep kernel source data despite the repository-wide benchmark CSV rule.
-!*.csv
