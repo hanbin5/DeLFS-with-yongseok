@@ -2023,7 +2023,6 @@ int f2fs_write_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 	}
 
 	f2fs_restore_inmem_curseg(sbi);
-	/* TODO(A): f2fs_reinit_atgc_curseg() still uses the global CURSEG_I() */
 	f2fs_reinit_atgc_curseg(sbi);
 	stat_inc_cp_count(sbi);
 stop:

@@ -326,6 +326,11 @@ static inline struct curseg_info *CURSEG_I(struct f2fs_sb_info *sbi, int type)
 	return (struct curseg_info *)(SM_I(sbi)->curseg_array + type);
 }
 
+/* DeLFS: segment ownership (sentry lock unit) per core, see segment.c */
+int segno_to_sentry_cpu(struct f2fs_sb_info *sbi, unsigned int segno);
+void get_sentry_range_from_cpu(struct f2fs_sb_info *sbi, int cpu,
+				unsigned int *sentry_begin, unsigned int *sentry_end);
+
 /* DeLFS: per-core curseg array of @cpu */
 static inline struct curseg_info_array *WRAP_CURSEG_I(struct f2fs_sb_info *sbi,
 							int cpu)

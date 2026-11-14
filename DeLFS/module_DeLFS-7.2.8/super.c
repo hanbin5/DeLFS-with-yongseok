@@ -5310,8 +5310,13 @@ try_onemore:
 			ZONED_PIN_SEC_REQUIRED_COUNT :
 			GET_SEC_FROM_SEG(sbi, overprovision_segments(sbi));
 
-	/* Read accumulated write IO statistics if exists */
-	seg_i = CURSEG_I(sbi, CURSEG_HOT_NODE);
+	/*
+	 * Read accumulated write IO statistics if exists.
+	 * DeLFS: do_checkpoint() stores the same value in the hot node journal
+	 * of every core; read it from the first online core.
+	 */
+	seg_i = WRAP_CURSEG_I(sbi, cpumask_first(cpu_online_mask))->array +
+							CURSEG_HOT_NODE;
 	if (__exist_node_summaries(sbi))
 		sbi->kbytes_written =
 			le64_to_cpu(seg_i->journal->info.kbytes_written);
