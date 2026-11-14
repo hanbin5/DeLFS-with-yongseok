@@ -7,7 +7,7 @@
  */
 #include <linux/unaligned.h>
 #include <linux/fs.h>
-#include <linux/f2fs_fs.h>
+#include "delfs_fs.h"
 #include <linux/sched/mm.h>
 #include <linux/fserror.h>
 #include "f2fs.h"

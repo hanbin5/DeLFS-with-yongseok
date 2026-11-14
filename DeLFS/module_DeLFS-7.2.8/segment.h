@@ -28,6 +28,35 @@
 #define IS_NODESEG(t)	((t) >= CURSEG_HOT_NODE && (t) <= CURSEG_COLD_NODE)
 #define SE_PAGETYPE(se)	((IS_NODESEG((se)->type) ? NODE : DATA))
 
+/*
+ * DeLFS: current-segment membership is tracked by reference counts
+ * (seg_entry->curseg_refs, sit_info->cursec_refs), since every core owns
+ * its own set of cursegs. See is_curseg()/is_cursec().
+ */
+#define IS_CURSEG(sbi, seg)	is_curseg((sbi), (seg))
+#define IS_CURSEC(sbi, secno)	is_cursec((sbi), (secno))
+
+/* DeLFS: check one core's curseg array (struct curseg_info *array) */
+#define IS_PER_CPU_CURSEG(array, seg)				\
+	(((seg) == ((array) + (CURSEG_HOT_DATA))->segno) ||	\
+	 ((seg) == ((array) + (CURSEG_WARM_DATA))->segno) ||	\
+	 ((seg) == ((array) + (CURSEG_COLD_DATA))->segno) ||	\
+	 ((seg) == ((array) + (CURSEG_HOT_NODE))->segno) ||	\
+	 ((seg) == ((array) + (CURSEG_WARM_NODE))->segno) ||	\
+	 ((seg) == ((array) + (CURSEG_COLD_NODE))->segno) ||	\
+	 ((seg) == ((array) + (CURSEG_COLD_DATA_PINNED))->segno) ||	\
+	 ((seg) == ((array) + (CURSEG_ALL_DATA_ATGC))->segno))
+
+#define IS_PER_CPU_CURSEC(sbi, secno, array)				\
+	(((secno) == GET_SEC_FROM_SEG(sbi, ((array) + (CURSEG_HOT_DATA))->segno)) ||	\
+	 ((secno) == GET_SEC_FROM_SEG(sbi, ((array) + (CURSEG_WARM_DATA))->segno)) ||	\
+	 ((secno) == GET_SEC_FROM_SEG(sbi, ((array) + (CURSEG_COLD_DATA))->segno)) ||	\
+	 ((secno) == GET_SEC_FROM_SEG(sbi, ((array) + (CURSEG_HOT_NODE))->segno)) ||	\
+	 ((secno) == GET_SEC_FROM_SEG(sbi, ((array) + (CURSEG_WARM_NODE))->segno)) ||	\
+	 ((secno) == GET_SEC_FROM_SEG(sbi, ((array) + (CURSEG_COLD_NODE))->segno)) ||	\
+	 ((secno) == GET_SEC_FROM_SEG(sbi, ((array) + (CURSEG_COLD_DATA_PINNED))->segno)) ||	\
+	 ((secno) == GET_SEC_FROM_SEG(sbi, ((array) + (CURSEG_ALL_DATA_ATGC))->segno)))
+
 static inline void sanity_check_seg_type(struct f2fs_sb_info *sbi,
 						unsigned short seg_type)
 {
@@ -184,6 +213,9 @@ struct seg_entry {
 	unsigned char *ckpt_valid_map;	/* validity bitmap of blocks last cp */
 	unsigned char *discard_map;
 	unsigned long long mtime;	/* modification time of the segment */
+
+	atomic_t curseg_cpu;		/* DeLFS: owner core hint (debug only) */
+	atomic_t curseg_refs;		/* DeLFS: authoritative current-segment membership */
 };
 
 struct sec_entry {
@@ -218,6 +250,7 @@ struct sit_info {
 	struct rw_semaphore sentry_lock;	/* to protect SIT cache */
 	struct seg_entry *sentries;		/* SIT segment-level cache */
 	struct sec_entry *sec_entries;		/* SIT section-level cache */
+	atomic_t *cursec_refs;			/* DeLFS: authoritative current-section membership, MAIN_SECS entries */
 
 	/* for cost-benefit algorithm in cleaning procedure */
 	unsigned long long elapsed_time;	/* elapsed time after mount */
@@ -293,26 +326,11 @@ static inline struct curseg_info *CURSEG_I(struct f2fs_sb_info *sbi, int type)
 	return (struct curseg_info *)(SM_I(sbi)->curseg_array + type);
 }
 
-static inline bool is_curseg(struct f2fs_sb_info *sbi, unsigned int segno)
+/* DeLFS: per-core curseg array of @cpu */
+static inline struct curseg_info_array *WRAP_CURSEG_I(struct f2fs_sb_info *sbi,
+							int cpu)
 {
-	int i;
-
-	for (i = CURSEG_HOT_DATA; i < NO_CHECK_TYPE; i++) {
-		if (segno == CURSEG_I(sbi, i)->segno)
-			return true;
-	}
-	return false;
-}
-
-static inline bool is_cursec(struct f2fs_sb_info *sbi, unsigned int secno)
-{
-	int i;
-
-	for (i = CURSEG_HOT_DATA; i < NO_CHECK_TYPE; i++) {
-		if (secno == GET_SEC_FROM_SEG(sbi, CURSEG_I(sbi, i)->segno))
-			return true;
-	}
-	return false;
+	return per_cpu_ptr(SM_I(sbi)->wrap_curseg_array, cpu);
 }
 
 static inline struct seg_entry *get_seg_entry(struct f2fs_sb_info *sbi,
@@ -320,6 +338,59 @@ static inline struct seg_entry *get_seg_entry(struct f2fs_sb_info *sbi,
 {
 	struct sit_info *sit_i = SIT_I(sbi);
 	return &sit_i->sentries[segno];
+}
+
+/*
+ * DeLFS: a segment/section is "current" if any core's curseg holds a
+ * reference on it (f2fs_curseg_get/put), instead of scanning CURSEG_I().
+ */
+static inline bool is_curseg(struct f2fs_sb_info *sbi, unsigned int segno)
+{
+	if (segno == NULL_SEGNO)
+		return false;
+
+	return atomic_read(&get_seg_entry(sbi, segno)->curseg_refs) > 0;
+}
+
+static inline bool is_cursec(struct f2fs_sb_info *sbi, unsigned int secno)
+{
+	if (secno >= MAIN_SECS(sbi))
+		return false;
+
+	return atomic_read(&SIT_I(sbi)->cursec_refs[secno]) > 0;
+}
+
+static inline void f2fs_curseg_get(struct f2fs_sb_info *sbi,
+					unsigned int segno)
+{
+	unsigned int secno;
+
+	if (segno == NULL_SEGNO)
+		return;
+
+	secno = GET_SEC_FROM_SEG(sbi, segno);
+
+	atomic_inc(&get_seg_entry(sbi, segno)->curseg_refs);
+	atomic_inc(&SIT_I(sbi)->cursec_refs[secno]);
+}
+
+static inline void f2fs_curseg_put(struct f2fs_sb_info *sbi,
+					unsigned int segno)
+{
+	unsigned int secno;
+
+	if (segno == NULL_SEGNO)
+		return;
+
+	secno = GET_SEC_FROM_SEG(sbi, segno);
+
+	f2fs_bug_on(sbi,
+		atomic_read(&get_seg_entry(sbi, segno)->curseg_refs) <= 0);
+	f2fs_bug_on(sbi,
+		atomic_read(&SIT_I(sbi)->cursec_refs[secno]) <= 0);
+
+	atomic_dec(&get_seg_entry(sbi, segno)->curseg_refs);
+	atomic_dec(&SIT_I(sbi)->cursec_refs[secno]);
 }
 
 static inline struct sec_entry *get_sec_entry(struct f2fs_sb_info *sbi,
@@ -497,6 +568,15 @@ static inline void __set_test_and_free(struct f2fs_sb_info *sbi,
 	bool ret;
 
 	spin_lock(&free_i->segmap_lock);
+
+	/*
+	 * DeLFS: a segment still referenced as a curseg by any core
+	 * (curseg_refs > 0) must keep its free_segmap bit, even if it was
+	 * put on the PRE list.
+	 */
+	if (!inmem && is_curseg(sbi, segno))
+		goto unlock_out;
+
 	ret = test_and_clear_bit(segno, free_i->free_segmap);
 	if (!ret)
 		goto unlock_out;
@@ -607,39 +687,73 @@ static inline unsigned int get_left_section_blocks(struct f2fs_sb_info *sbi,
 	return CAP_BLKS_PER_SEC(sbi) - get_ckpt_valid_blocks(sbi, segno, true);
 }
 
+/* DeLFS: same as get_left_section_blocks(), but for a given (per-core) curseg */
+static inline unsigned int get_left_section_blocks_curseg(struct f2fs_sb_info *sbi,
+					struct curseg_info *curseg)
+{
+	unsigned int segno = curseg->segno;
+
+	if (f2fs_lfs_mode(sbi)) {
+		unsigned int used_blocks = __is_large_section(sbi) ? SEGS_TO_BLKS(sbi,
+				(segno - GET_START_SEG_FROM_SEC(sbi, segno))) : 0;
+		return CAP_BLKS_PER_SEC(sbi) - used_blocks - curseg->next_blkoff;
+	}
+	return CAP_BLKS_PER_SEC(sbi) - get_ckpt_valid_blocks(sbi, segno, true);
+}
+
+/*
+ * DeLFS: cursegs are per-core, so dirty node/dentry/data blocks can be
+ * spread over every core's current sections. Instead of the worst-case
+ * (minimum) left space of a single curseg as in vanilla f2fs, aggregate
+ * the left space over all online cores, per category (as DeLFS'
+ * has_curseg_enough_space() did), and subtract it from the totals.
+ */
 static inline void get_additional_blocks_required(struct f2fs_sb_info *sbi,
 			unsigned int *total_node_blocks, unsigned int *total_data_blocks,
 			unsigned int *total_dent_blocks, bool separate_dent)
 {
-	unsigned int segno, left_blocks;
-	int i;
-	unsigned int min_free_node_blocks = CAP_BLKS_PER_SEC(sbi);
-	unsigned int min_free_dent_blocks = CAP_BLKS_PER_SEC(sbi);
-	unsigned int min_free_data_blocks = CAP_BLKS_PER_SEC(sbi);
+	unsigned int left_blocks;
+	unsigned long free_node_blocks = 0;
+	unsigned long free_dent_blocks = 0;
+	unsigned long free_data_blocks = 0;
+	int i, cpu;
 
-	/* check current data/node sections in the worst case. */
-	for (i = CURSEG_HOT_DATA; i < NR_PERSISTENT_LOG; i++) {
-		segno = CURSEG_I(sbi, i)->segno;
+	/* TODO(A): DeLFS iterated online cpus only; confirm cursegs of offline cpus are not counted/needed */
+	for_each_online_cpu(cpu) {
+		struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
 
-		if (unlikely(segno == NULL_SEGNO))
-			return;
+		for (i = CURSEG_HOT_DATA; i < NR_PERSISTENT_LOG; i++) {
+			struct curseg_info *curseg = cpu_array->array + i;
 
-		left_blocks = get_left_section_blocks(sbi, i, segno);
+			if (curseg->segno == NULL_SEGNO)
+				continue;
 
-		if (i > CURSEG_COLD_DATA)
-			min_free_node_blocks = min(min_free_node_blocks, left_blocks);
-		else if (i == CURSEG_HOT_DATA && separate_dent)
-			min_free_dent_blocks = left_blocks;
-		else
-			min_free_data_blocks = min(min_free_data_blocks, left_blocks);
+			/*
+			 * TODO(A): with large sections, cursegs of different
+			 * cores may share one section, so its left blocks can
+			 * be counted more than once here.
+			 */
+			left_blocks = get_left_section_blocks_curseg(sbi, curseg);
+
+			if (i > CURSEG_COLD_DATA)
+				free_node_blocks += left_blocks;
+			else if (i == CURSEG_HOT_DATA && separate_dent)
+				free_dent_blocks += left_blocks;
+			else
+				/*
+				 * TODO(A): DeLFS(6.6.8) had no data-block check;
+				 * data space is aggregated the same way as node.
+				 */
+				free_data_blocks += left_blocks;
+		}
 	}
 
-	*total_node_blocks = (*total_node_blocks > min_free_node_blocks) ?
-			*total_node_blocks - min_free_node_blocks : 0;
-	*total_dent_blocks = (*total_dent_blocks > min_free_dent_blocks) ?
-			*total_dent_blocks - min_free_dent_blocks : 0;
-	*total_data_blocks = (*total_data_blocks > min_free_data_blocks) ?
-			*total_data_blocks - min_free_data_blocks : 0;
+	*total_node_blocks = (*total_node_blocks > free_node_blocks) ?
+			*total_node_blocks - free_node_blocks : 0;
+	*total_dent_blocks = (*total_dent_blocks > free_dent_blocks) ?
+			*total_dent_blocks - free_dent_blocks : 0;
+	*total_data_blocks = (*total_data_blocks > free_data_blocks) ?
+			*total_data_blocks - free_data_blocks : 0;
 }
 
 /*
@@ -733,6 +847,7 @@ static inline bool excess_prefree_segs(struct f2fs_sb_info *sbi)
 
 static inline int utilization(struct f2fs_sb_info *sbi)
 {
+	/* TODO(A): DeLFS reads sbi->user_block_count via atomic_read(); switch together with the sbi atomic_t conversion (next step) */
 	return div_u64((u64)valid_user_blocks(sbi) * 100,
 					sbi->user_block_count);
 }
@@ -796,17 +911,28 @@ F2FS_IPU_POLICY(F2FS_IPU_ASYNC);
 F2FS_IPU_POLICY(F2FS_IPU_NOCACHE);
 F2FS_IPU_POLICY(F2FS_IPU_HONOR_OPU_WRITE);
 
+/*
+ * DeLFS: returns the curseg of the core this runs on.
+ * TODO(A): DeLFS marked these "need to check" (no in-tree caller); the
+ * result is only a hint since the task may migrate right after.
+ */
 static inline unsigned int curseg_segno(struct f2fs_sb_info *sbi,
 		int type)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	struct curseg_info_array *cpu_array =
+			WRAP_CURSEG_I(sbi, raw_smp_processor_id());
+	struct curseg_info *curseg = cpu_array->array + type;
+
 	return curseg->segno;
 }
 
 static inline unsigned char curseg_alloc_type(struct f2fs_sb_info *sbi,
 		int type)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	struct curseg_info_array *cpu_array =
+			WRAP_CURSEG_I(sbi, raw_smp_processor_id());
+	struct curseg_info *curseg = cpu_array->array + type;
+
 	return curseg->alloc_type;
 }
 
@@ -941,22 +1067,35 @@ static inline void set_summary(struct f2fs_summary *sum, nid_t nid,
 	sum->version = version;
 }
 
+/* DeLFS: # of summary blocks one core occupies in a cp pack */
+static inline int percore_sum_step(struct f2fs_sb_info *sbi, int max_npages)
+{
+	return max_npages +
+		(__exist_node_summaries(sbi) ? NR_CURSEG_NODE_TYPE : 0);
+}
+
 static inline block_t start_sum_block(struct f2fs_sb_info *sbi)
 {
 	return __start_cp_addr(sbi) +
 		le32_to_cpu(F2FS_CKPT(sbi)->cp_pack_start_sum);
 }
 
-static inline block_t sum_blk_addr(struct f2fs_sb_info *sbi, int base, int type)
+/*
+ * DeLFS: per-core summary block address, counted backwards from the end of
+ * the cp pack: [... core0 sums | ... | core(n-1) sums | cp header (F2FS_CP_HDR_BLKS)]
+ */
+static inline block_t sum_blk_addr(struct f2fs_sb_info *sbi, int base, int type,
+		long num_cpus, int cpu, int max_npages)
 {
 	return __start_cp_addr(sbi) +
 		le32_to_cpu(F2FS_CKPT(sbi)->cp_pack_total_block_count)
-				- (base + 1) + type;
+		- (base + F2FS_CP_HDR_BLKS) + type
+		- ((num_cpus - (cpu + 1)) * percore_sum_step(sbi, max_npages));
 }
 
 static inline bool sec_usage_check(struct f2fs_sb_info *sbi, unsigned int secno)
 {
-	if (is_cursec(sbi, secno) || (sbi->cur_victim_sec == secno))
+	if (is_cursec(sbi, secno) || READ_ONCE(sbi->cur_victim_sec) == secno)
 		return true;
 	return false;
 }

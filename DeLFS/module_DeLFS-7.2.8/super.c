@@ -20,7 +20,7 @@
 #include <linux/exportfs.h>
 #include <linux/blkdev.h>
 #include <linux/quotaops.h>
-#include <linux/f2fs_fs.h>
+#include "delfs_fs.h"
 #include <linux/sysfs.h>
 #include <linux/quota.h>
 #include <linux/unicode.h>

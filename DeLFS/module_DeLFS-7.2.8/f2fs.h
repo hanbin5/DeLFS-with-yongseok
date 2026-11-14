@@ -1188,11 +1188,17 @@ struct flush_cmd_control {
 	struct llist_node *dispatch_list;	/* list for command dispatch */
 };
 
+/* DeLFS: per-core array of current segments (NR_CURSEG_TYPE entries) */
+struct curseg_info_array {
+	struct curseg_info *array;
+};
+
 struct f2fs_sm_info {
 	struct sit_info *sit_info;		/* whole segment information */
 	struct free_segmap_info *free_info;	/* free segment information */
 	struct dirty_seglist_info *dirty_info;	/* dirty segment information */
 	struct curseg_info *curseg_array;	/* active segment information */
+	struct curseg_info_array __percpu *wrap_curseg_array;	/* DeLFS: per-core active segment information */
 
 	struct f2fs_rwsem curseg_lock;	/* for preventing curseg change */
 
@@ -1370,6 +1376,7 @@ struct f2fs_io_info {
 	struct writeback_control *io_wbc; /* writeback control */
 	struct bio **bio;		/* bio for ipu */
 	sector_t *last_block;		/* last block number in bio */
+	int cpu;			/* DeLFS: core whose cursegs serve this IO */
 };
 
 struct bio_entry {
@@ -2902,8 +2909,9 @@ static inline void *__bitmap_ptr(struct f2fs_sb_info *sbi, int flag)
 	if (__cp_payload(sbi) > 0) {
 		if (flag == NAT_BITMAP)
 			return tmp_ptr;
-		else
-			return (unsigned char *)ckpt + F2FS_BLKSIZE;
+		else	/* DeLFS: SIT bitmap follows the F2FS_CP_HDR_BLKS-block cp header */
+			return (unsigned char *)ckpt +
+				F2FS_CP_HDR_BLKS * F2FS_BLKSIZE;
 	} else {
 		offset = (flag == NAT_BITMAP) ?
 			le32_to_cpu(ckpt->sit_ver_bitmap_bytesize) : 0;
@@ -2915,8 +2923,9 @@ static inline block_t __start_cp_addr(struct f2fs_sb_info *sbi)
 {
 	block_t start_addr = le32_to_cpu(F2FS_RAW_SUPER(sbi)->cp_blkaddr);
 
+	/* DeLFS: one cp pack spans F2FS_CP_PACK_SEGS segments */
 	if (sbi->cur_cp_pack == 2)
-		start_addr += BLKS_PER_SEG(sbi);
+		start_addr += F2FS_CP_PACK_SEGS * BLKS_PER_SEG(sbi);
 	return start_addr;
 }
 
@@ -2924,8 +2933,9 @@ static inline block_t __start_cp_next_addr(struct f2fs_sb_info *sbi)
 {
 	block_t start_addr = le32_to_cpu(F2FS_RAW_SUPER(sbi)->cp_blkaddr);
 
+	/* DeLFS: one cp pack spans F2FS_CP_PACK_SEGS segments */
 	if (sbi->cur_cp_pack == 1)
-		start_addr += BLKS_PER_SEG(sbi);
+		start_addr += F2FS_CP_PACK_SEGS * BLKS_PER_SEG(sbi);
 	return start_addr;
 }
 

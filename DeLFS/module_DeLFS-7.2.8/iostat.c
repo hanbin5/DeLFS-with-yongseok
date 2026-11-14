@@ -7,7 +7,7 @@
  */
 
 #include <linux/fs.h>
-#include <linux/f2fs_fs.h>
+#include "delfs_fs.h"
 #include <linux/seq_file.h>
 
 #include "f2fs.h"
