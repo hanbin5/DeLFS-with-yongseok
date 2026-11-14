@@ -51,7 +51,7 @@ bool f2fs_space_for_roll_forward(struct f2fs_sb_info *sbi)
 {
 	s64 nalloc = percpu_counter_sum_positive(&sbi->alloc_valid_block_count);
 
-	if (sbi->last_valid_block_count + nalloc > sbi->user_block_count)
+	if ((block_t)atomic_read(&sbi->last_valid_block_count) + nalloc > (block_t)atomic_read(&sbi->user_block_count))
 		return false;
 	if (NM_I(sbi)->max_rf_node_blocks &&
 		percpu_counter_sum_positive(&sbi->rf_node_block_count) >=

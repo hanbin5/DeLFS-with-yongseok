@@ -1407,7 +1407,7 @@ static void __prepare_cp_block(struct f2fs_sb_info *sbi)
 	ckpt->next_free_nid = cpu_to_le32(last_nid);
 
 	/* update user_block_counts */
-	sbi->last_valid_block_count = sbi->total_valid_block_count;
+	atomic_set(&sbi->last_valid_block_count, (block_t)atomic_read(&sbi->total_valid_block_count));
 	percpu_counter_set(&sbi->alloc_valid_block_count, 0);
 	percpu_counter_set(&sbi->rf_node_block_count, 0);
 }
@@ -1950,7 +1950,7 @@ int f2fs_write_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 
 	if (!is_sbi_flag_set(sbi, SBI_IS_DIRTY) &&
 		((cpc->reason & CP_FASTBOOT) || (cpc->reason & CP_SYNC) ||
-		((cpc->reason & CP_DISCARD) && !sbi->discard_blks)))
+		((cpc->reason & CP_DISCARD) && !(block_t)atomic_read(&sbi->discard_blks))))
 		goto out;
 	if (unlikely(f2fs_cp_error(sbi))) {
 		err = -EIO;

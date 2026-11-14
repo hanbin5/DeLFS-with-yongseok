@@ -680,19 +680,7 @@ static inline int reserved_sections(struct f2fs_sb_info *sbi)
 	return GET_SEC_FROM_SEG(sbi, reserved_segments(sbi));
 }
 
-static inline unsigned int get_left_section_blocks(struct f2fs_sb_info *sbi,
-					enum log_type type, unsigned int segno)
-{
-	if (f2fs_lfs_mode(sbi)) {
-		unsigned int used_blocks = __is_large_section(sbi) ? SEGS_TO_BLKS(sbi,
-				(segno - GET_START_SEG_FROM_SEC(sbi, segno))) : 0;
-		return CAP_BLKS_PER_SEC(sbi) - used_blocks -
-			CURSEG_I(sbi, type)->next_blkoff;
-	}
-	return CAP_BLKS_PER_SEC(sbi) - get_ckpt_valid_blocks(sbi, segno, true);
-}
-
-/* DeLFS: same as get_left_section_blocks(), but for a given (per-core) curseg */
+/* DeLFS: left blocks of the current section of a given (per-core) curseg */
 static inline unsigned int get_left_section_blocks_curseg(struct f2fs_sb_info *sbi,
 					struct curseg_info *curseg)
 {
@@ -852,9 +840,8 @@ static inline bool excess_prefree_segs(struct f2fs_sb_info *sbi)
 
 static inline int utilization(struct f2fs_sb_info *sbi)
 {
-	/* TODO(A): DeLFS reads sbi->user_block_count via atomic_read(); switch together with the sbi atomic_t conversion (next step) */
 	return div_u64((u64)valid_user_blocks(sbi) * 100,
-					sbi->user_block_count);
+					(block_t)atomic_read(&sbi->user_block_count));
 }
 
 /*

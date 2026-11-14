@@ -1883,12 +1883,18 @@ struct f2fs_sb_info {
 	unsigned int nat_journal_entries;	/* nat journal entry count in the journal */
 	unsigned int sit_journal_entries;	/* sit journal entry count in the journal */
 
-	block_t user_block_count;		/* # of user blocks */
-	block_t total_valid_block_count;	/* # of valid blocks */
-	block_t discard_blks;			/* discard command candidats */
-	block_t last_valid_block_count;		/* for recovery */
-	block_t reserved_blocks;		/* configurable reserved blocks */
-	block_t current_reserved_blocks;	/* current reserved blocks */
+	/*
+	 * DeLFS: block counters are atomic_t, as in DeLFS 6.6.8.
+	 * TODO(A): atomic_t is a signed int while block_t is u32; a volume with
+	 * more than 2^31 blocks (8 TiB with 4 KiB blocks) would go negative.
+	 * Readers cast atomic_read() back to block_t to keep the u32 semantics.
+	 */
+	atomic_t user_block_count;		/* # of user blocks */
+	atomic_t total_valid_block_count;	/* # of valid blocks */
+	atomic_t discard_blks;			/* discard command candidats */
+	atomic_t last_valid_block_count;	/* for recovery */
+	atomic_t reserved_blocks;		/* configurable reserved blocks */
+	atomic_t current_reserved_blocks;	/* current reserved blocks */
 
 	/* Additional tracking for no checkpoint mode */
 	block_t unusable_block_count;		/* # of blocks saved by last cp */
@@ -2590,8 +2596,8 @@ static inline unsigned int get_available_block_count(struct f2fs_sb_info *sbi,
 {
 	block_t avail_user_block_count;
 
-	avail_user_block_count = sbi->user_block_count -
-					sbi->current_reserved_blocks;
+	avail_user_block_count = (block_t)atomic_read(&sbi->user_block_count) -
+				(block_t)atomic_read(&sbi->current_reserved_blocks);
 
 	if (test_opt(sbi, RESERVE_ROOT) && !__allow_reserved_root(sbi, inode, cap))
 		avail_user_block_count -= F2FS_OPTION(sbi).root_reserved_blocks;
@@ -2632,7 +2638,7 @@ static inline int inc_valid_block_count(struct f2fs_sb_info *sbi,
 	spin_lock(&sbi->stat_lock);
 
 	avail_user_block_count = get_available_block_count(sbi, inode, true);
-	diff = (long long)sbi->total_valid_block_count + *count -
+	diff = (long long)(block_t)atomic_read(&sbi->total_valid_block_count) + *count -
 						avail_user_block_count;
 	if (unlikely(diff > 0)) {
 		if (!partial) {
@@ -2649,7 +2655,7 @@ static inline int inc_valid_block_count(struct f2fs_sb_info *sbi,
 			goto enospc;
 		}
 	}
-	sbi->total_valid_block_count += (block_t)(*count);
+	atomic_add((block_t)(*count), &sbi->total_valid_block_count);
 
 	spin_unlock(&sbi->stat_lock);
 
@@ -2761,18 +2767,19 @@ static inline void dec_valid_block_count(struct f2fs_sb_info *sbi,
 	blkcnt_t sectors = count << F2FS_LOG_SECTORS_PER_BLOCK;
 
 	spin_lock(&sbi->stat_lock);
-	if (unlikely(sbi->total_valid_block_count < count)) {
+	if (unlikely((block_t)atomic_read(&sbi->total_valid_block_count) < count)) {
 		f2fs_warn(sbi, "Inconsistent total_valid_block_count:%u, ino:%llu, count:%u",
-			  sbi->total_valid_block_count, inode->i_ino, count);
-		sbi->total_valid_block_count = 0;
+			  (block_t)atomic_read(&sbi->total_valid_block_count), inode->i_ino, count);
+		atomic_set(&sbi->total_valid_block_count, 0);
 		set_sbi_flag(sbi, SBI_NEED_FSCK);
 	} else {
-		sbi->total_valid_block_count -= count;
+		atomic_sub(count, &sbi->total_valid_block_count);
 	}
-	if (sbi->reserved_blocks &&
-		sbi->current_reserved_blocks < sbi->reserved_blocks)
-		sbi->current_reserved_blocks = min(sbi->reserved_blocks,
-					sbi->current_reserved_blocks + count);
+	if ((block_t)atomic_read(&sbi->reserved_blocks) &&
+		(block_t)atomic_read(&sbi->current_reserved_blocks) < (block_t)atomic_read(&sbi->reserved_blocks))
+		atomic_set(&sbi->current_reserved_blocks,
+			min((block_t)atomic_read(&sbi->reserved_blocks),
+				(block_t)atomic_read(&sbi->current_reserved_blocks) + count));
 	spin_unlock(&sbi->stat_lock);
 	if (unlikely(inode->i_blocks < sectors)) {
 		f2fs_warn(sbi, "Inconsistent i_blocks, ino:%llu, iblocks:%llu, sectors:%llu",
@@ -2864,12 +2871,12 @@ static inline int get_blocktype_secs(struct f2fs_sb_info *sbi, int block_type)
 
 static inline block_t valid_user_blocks(struct f2fs_sb_info *sbi)
 {
-	return sbi->total_valid_block_count;
+	return (block_t)atomic_read(&sbi->total_valid_block_count);
 }
 
 static inline block_t discard_blocks(struct f2fs_sb_info *sbi)
 {
-	return sbi->discard_blks;
+	return (block_t)atomic_read(&sbi->discard_blks);
 }
 
 static inline unsigned long __bitmap_size(struct f2fs_sb_info *sbi, int flag)
@@ -2983,7 +2990,7 @@ static inline int inc_valid_node_count(struct f2fs_sb_info *sbi,
 
 	spin_lock(&sbi->stat_lock);
 
-	valid_block_count = sbi->total_valid_block_count + 1;
+	valid_block_count = (block_t)atomic_read(&sbi->total_valid_block_count) + 1;
 	avail_user_block_count = get_available_block_count(sbi, inode,
 			test_opt(sbi, RESERVE_NODE));
 
@@ -3003,7 +3010,7 @@ static inline int inc_valid_node_count(struct f2fs_sb_info *sbi,
 	}
 
 	sbi->total_valid_node_count++;
-	sbi->total_valid_block_count++;
+	atomic_inc(&sbi->total_valid_block_count);
 	spin_unlock(&sbi->stat_lock);
 
 	if (inode) {
@@ -3031,20 +3038,20 @@ static inline void dec_valid_node_count(struct f2fs_sb_info *sbi,
 {
 	spin_lock(&sbi->stat_lock);
 
-	if (unlikely(!sbi->total_valid_block_count ||
+	if (unlikely(!atomic_read(&sbi->total_valid_block_count) ||
 			!sbi->total_valid_node_count)) {
 		f2fs_warn(sbi, "dec_valid_node_count: inconsistent block counts, total_valid_block:%u, total_valid_node:%u",
-			  sbi->total_valid_block_count,
+			  (block_t)atomic_read(&sbi->total_valid_block_count),
 			  sbi->total_valid_node_count);
 		set_sbi_flag(sbi, SBI_NEED_FSCK);
 	} else {
-		sbi->total_valid_block_count--;
+		atomic_dec(&sbi->total_valid_block_count);
 		sbi->total_valid_node_count--;
 	}
 
-	if (sbi->reserved_blocks &&
-		sbi->current_reserved_blocks < sbi->reserved_blocks)
-		sbi->current_reserved_blocks++;
+	if ((block_t)atomic_read(&sbi->reserved_blocks) &&
+		(block_t)atomic_read(&sbi->current_reserved_blocks) < (block_t)atomic_read(&sbi->reserved_blocks))
+		atomic_inc(&sbi->current_reserved_blocks);
 
 	spin_unlock(&sbi->stat_lock);
 

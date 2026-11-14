@@ -505,8 +505,8 @@ static void f2fs_destroy_casefold_cache(void) { }
 
 static inline void limit_reserve_root(struct f2fs_sb_info *sbi)
 {
-	block_t block_limit = min((sbi->user_block_count >> 3),
-			sbi->user_block_count - sbi->reserved_blocks);
+	block_t block_limit = min(((block_t)atomic_read(&sbi->user_block_count) >> 3),
+			(block_t)atomic_read(&sbi->user_block_count) - (block_t)atomic_read(&sbi->reserved_blocks));
 	block_t node_limit = sbi->total_node_count >> 3;
 
 	/* limit is 12.5% */
@@ -541,9 +541,9 @@ static inline void adjust_unusable_cap_perc(struct f2fs_sb_info *sbi)
 		return;
 
 	if (F2FS_OPTION(sbi).unusable_cap_perc == 100)
-		F2FS_OPTION(sbi).unusable_cap = sbi->user_block_count;
+		F2FS_OPTION(sbi).unusable_cap = (block_t)atomic_read(&sbi->user_block_count);
 	else
-		F2FS_OPTION(sbi).unusable_cap = (sbi->user_block_count / 100) *
+		F2FS_OPTION(sbi).unusable_cap = ((block_t)atomic_read(&sbi->user_block_count) / 100) *
 					F2FS_OPTION(sbi).unusable_cap_perc;
 
 	f2fs_info(sbi, "Adjust unusable cap for checkpoint=disable = %u / %u%%",
@@ -2016,7 +2016,7 @@ static void f2fs_put_super(struct super_block *sb)
 
 	/* be sure to wait for any on-going discard commands */
 	done = f2fs_issue_discard_timeout(sbi, true);
-	if (f2fs_realtime_discard_enable(sbi) && !sbi->discard_blks && done) {
+	if (f2fs_realtime_discard_enable(sbi) && !(block_t)atomic_read(&sbi->discard_blks) && done) {
 		struct cp_control cpc = {
 			.reason = CP_UMOUNT | CP_TRIMMED,
 		};
@@ -2239,12 +2239,12 @@ static int f2fs_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 	spin_lock(&sbi->stat_lock);
 	if (sbi->carve_out)
-		buf->f_blocks -= sbi->current_reserved_blocks;
-	user_block_count = sbi->user_block_count;
+		buf->f_blocks -= (block_t)atomic_read(&sbi->current_reserved_blocks);
+	user_block_count = (block_t)atomic_read(&sbi->user_block_count);
 	total_valid_node_count = valid_node_count(sbi);
 	avail_node_count = sbi->total_node_count - F2FS_RESERVED_NODE_NUM;
 	buf->f_bfree = user_block_count - valid_user_blocks(sbi) -
-						sbi->current_reserved_blocks;
+						(block_t)atomic_read(&sbi->current_reserved_blocks);
 
 	if (unlikely(buf->f_bfree <= sbi->unusable_block_count))
 		buf->f_bfree = 0;
@@ -5258,12 +5258,11 @@ try_onemore:
 				le32_to_cpu(sbi->ckpt->valid_node_count);
 	percpu_counter_set(&sbi->total_valid_inode_count,
 				le32_to_cpu(sbi->ckpt->valid_inode_count));
-	sbi->user_block_count = le64_to_cpu(sbi->ckpt->user_block_count);
-	sbi->total_valid_block_count =
-				le64_to_cpu(sbi->ckpt->valid_block_count);
-	sbi->last_valid_block_count = sbi->total_valid_block_count;
-	sbi->reserved_blocks = 0;
-	sbi->current_reserved_blocks = 0;
+	atomic_set(&sbi->user_block_count, le64_to_cpu(sbi->ckpt->user_block_count));
+	atomic_set(&sbi->total_valid_block_count, le64_to_cpu(sbi->ckpt->valid_block_count));
+	atomic_set(&sbi->last_valid_block_count, (block_t)atomic_read(&sbi->total_valid_block_count));
+	atomic_set(&sbi->reserved_blocks, 0);
+	atomic_set(&sbi->current_reserved_blocks, 0);
 	limit_reserve_root(sbi);
 	adjust_unusable_cap_perc(sbi);
 

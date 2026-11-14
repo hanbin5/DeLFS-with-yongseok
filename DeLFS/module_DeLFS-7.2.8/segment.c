@@ -2165,7 +2165,7 @@ static int f2fs_issue_discard(struct f2fs_sb_info *sbi,
 
 		if (f2fs_block_unit_discard(sbi) &&
 				!f2fs_test_and_set_bit(offset, se->discard_map))
-			sbi->discard_blks--;
+			atomic_dec(&sbi->discard_blks);
 	}
 
 	if (len)
@@ -2567,7 +2567,7 @@ static int update_sit_entry_for_release(struct f2fs_sb_info *sbi, struct seg_ent
 
 		if (f2fs_block_unit_discard(sbi) &&
 				f2fs_test_and_clear_bit(offset + i, se->discard_map))
-			sbi->discard_blks++;
+			atomic_inc(&sbi->discard_blks);
 
 		if (!f2fs_test_bit(offset + i, se->ckpt_valid_map)) {
 			se->ckpt_valid_blocks -= 1;
@@ -2597,7 +2597,7 @@ static int update_sit_entry_for_alloc(struct f2fs_sb_info *sbi, struct seg_entry
 
 	if (f2fs_block_unit_discard(sbi) &&
 			!f2fs_test_and_set_bit(offset, se->discard_map))
-		sbi->discard_blks--;
+		atomic_dec(&sbi->discard_blks);
 
 	/*
 	 * SSR should never reuse block which is checkpointed
@@ -3706,7 +3706,7 @@ int f2fs_trim_fs(struct f2fs_sb_info *sbi, struct fstrim_range *range)
 	cpc.trim_start = start_segno;
 	cpc.trim_end = end_segno;
 
-	if (sbi->discard_blks == 0)
+	if ((block_t)atomic_read(&sbi->discard_blks) == 0)
 		goto out;
 
 	f2fs_down_write_trace(&sbi->gc_lock, &lc);
@@ -5363,8 +5363,8 @@ static int build_sit_entries(struct f2fs_sb_info *sbi)
 			}
 			memcpy(se->discard_map, se->cur_valid_map,
 						SIT_VBLOCK_MAP_SIZE);
-			sbi->discard_blks += BLKS_PER_SEG(sbi) -
-						se->valid_blocks;
+			atomic_add(BLKS_PER_SEG(sbi) -
+						se->valid_blocks, &sbi->discard_blks);
 init_discard_map_done:
 			if (__is_large_section(sbi))
 				get_sec_entry(sbi, start)->valid_blocks +=
@@ -5414,8 +5414,8 @@ init_discard_map_done:
 			} else {
 				memcpy(se->discard_map, se->cur_valid_map,
 							SIT_VBLOCK_MAP_SIZE);
-				sbi->discard_blks += old_valid_blocks;
-				sbi->discard_blks -= se->valid_blocks;
+				atomic_add(old_valid_blocks, &sbi->discard_blks);
+				atomic_sub(se->valid_blocks, &sbi->discard_blks);
 			}
 		}
 
