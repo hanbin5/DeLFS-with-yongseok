@@ -4056,7 +4056,8 @@ void f2fs_dirty_to_prefree(struct f2fs_sb_info *sbi);
 block_t f2fs_get_unusable_blocks(struct f2fs_sb_info *sbi);
 int f2fs_disable_cp_again(struct f2fs_sb_info *sbi, block_t unusable);
 void f2fs_release_discard_addrs(struct f2fs_sb_info *sbi);
-int f2fs_npages_for_summary_flush(struct f2fs_sb_info *sbi, bool for_ra);
+int percore_f2fs_npages_for_summary_flush(struct f2fs_sb_info *sbi,
+			bool for_ra, int cpu);
 bool f2fs_segment_has_free_slot(struct f2fs_sb_info *sbi, int segno);
 int f2fs_init_inmem_curseg(struct f2fs_sb_info *sbi);
 int f2fs_reinit_atgc_curseg(struct f2fs_sb_info *sbi);
@@ -4102,8 +4103,10 @@ void f2fs_folio_wait_writeback(struct folio *folio, enum page_type type,
 void f2fs_wait_on_block_writeback(struct inode *inode, block_t blkaddr);
 void f2fs_wait_on_block_writeback_range(struct inode *inode, block_t blkaddr,
 								block_t len);
-void f2fs_write_data_summaries(struct f2fs_sb_info *sbi, block_t start_blk);
-void f2fs_write_node_summaries(struct f2fs_sb_info *sbi, block_t start_blk);
+void f2fs_write_data_summaries(struct f2fs_sb_info *sbi, block_t start_blk,
+		int blk_cnt, int cpu, struct curseg_info_array *cpu_array);
+void f2fs_write_node_summaries(struct f2fs_sb_info *sbi, block_t start_blk,
+		int cpu, struct curseg_info_array *cpu_array);
 int f2fs_lookup_journal_in_cursum(struct f2fs_sb_info *sbi,
 			struct f2fs_journal *journal, int type,
 			unsigned int val, int alloc);
