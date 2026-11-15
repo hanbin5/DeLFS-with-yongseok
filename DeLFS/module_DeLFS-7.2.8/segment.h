@@ -234,7 +234,7 @@ struct revoke_entry {
 struct sit_info {
 	block_t sit_base_addr;		/* start block address of SIT area */
 	block_t sit_blocks;		/* # of blocks used by SIT area */
-	block_t written_valid_blocks;	/* # of valid blocks in main area */
+	atomic64_t written_valid_blocks;	/* # of valid blocks in main area (DeLFS: atomic) */
 	char *bitmap;			/* all bitmaps pointer */
 	char *sit_bitmap;		/* SIT bitmap pointer */
 #ifdef CONFIG_F2FS_CHECK_FS
@@ -245,9 +245,14 @@ struct sit_info {
 
 	unsigned long *tmp_map;			/* bitmap for temporal use */
 	unsigned long *dirty_sentries_bitmap;	/* bitmap for dirty sentries */
-	unsigned int dirty_sentries;		/* # of dirty sentries */
+	atomic_t dirty_sentries;		/* # of dirty sentries (DeLFS: atomic) */
 	unsigned int sents_per_block;		/* # of SIT entries per block */
-	struct rw_semaphore sentry_lock;	/* to protect SIT cache */
+	/*
+	 * DeLFS deSIT: one SIT lock per core region instead of the global
+	 * sentry_lock. The segments of a region are only changed under that
+	 * region's lock, one lock at a time (DDL).
+	 */
+	struct rw_semaphore __percpu *percore_sentry_lock;
 	struct seg_entry *sentries;		/* SIT segment-level cache */
 	struct sec_entry *sec_entries;		/* SIT section-level cache */
 	atomic_t *cursec_refs;			/* DeLFS: authoritative current-section membership, MAIN_SECS entries */
@@ -285,16 +290,25 @@ enum dirty_type {
 	NR_DIRTY_TYPE
 };
 
+/* DeLFS: dirty segment lists of one core region */
+struct dirty_seg_percpu {
+	unsigned long *p_dirty_segmap[NR_DIRTY_TYPE];
+	unsigned long *p_dirty_secmap;
+	struct mutex p_seglist_lock;		/* lock for segment bitmaps */
+	int p_nr_dirty[NR_DIRTY_TYPE];		/* # of dirty segments */
+};
+
 struct dirty_seglist_info {
-	unsigned long *dirty_segmap[NR_DIRTY_TYPE];
-	unsigned long *dirty_secmap;
-	struct mutex seglist_lock;		/* lock for segment bitmaps */
-	int nr_dirty[NR_DIRTY_TYPE];		/* # of dirty segments */
+	struct dirty_seg_percpu __percpu *pcpu;	/* DeLFS: per core region */
+	atomic_t nr_dirty[NR_DIRTY_TYPE];	/* # of dirty segments, all regions */
 	unsigned long *victim_secmap;		/* background GC victims */
 	unsigned long *pinned_secmap;		/* pinned victims from foreground GC */
 	unsigned int pinned_secmap_cnt;		/* count of victims which has pinned data */
 	bool enable_pin_section;		/* enable pinning section */
 };
+
+void f2fs_remove_dirty_segment_locked(struct f2fs_sb_info *sbi,
+		unsigned int segno, enum dirty_type dirty_type);
 
 /* for active log information */
 struct curseg_info {
@@ -637,7 +651,7 @@ static inline void get_sit_bitmap(struct f2fs_sb_info *sbi,
 
 static inline block_t written_block_count(struct f2fs_sb_info *sbi)
 {
-	return SIT_I(sbi)->written_valid_blocks;
+	return (block_t)atomic64_read(&SIT_I(sbi)->written_valid_blocks);
 }
 
 static inline unsigned int free_segments(struct f2fs_sb_info *sbi)
@@ -657,17 +671,17 @@ static inline unsigned int free_sections(struct f2fs_sb_info *sbi)
 
 static inline unsigned int prefree_segments(struct f2fs_sb_info *sbi)
 {
-	return DIRTY_I(sbi)->nr_dirty[PRE];
+	return atomic_read(&DIRTY_I(sbi)->nr_dirty[PRE]);
 }
 
 static inline unsigned int dirty_segments(struct f2fs_sb_info *sbi)
 {
-	return DIRTY_I(sbi)->nr_dirty[DIRTY_HOT_DATA] +
-		DIRTY_I(sbi)->nr_dirty[DIRTY_WARM_DATA] +
-		DIRTY_I(sbi)->nr_dirty[DIRTY_COLD_DATA] +
-		DIRTY_I(sbi)->nr_dirty[DIRTY_HOT_NODE] +
-		DIRTY_I(sbi)->nr_dirty[DIRTY_WARM_NODE] +
-		DIRTY_I(sbi)->nr_dirty[DIRTY_COLD_NODE];
+	return atomic_read(&DIRTY_I(sbi)->nr_dirty[DIRTY_HOT_DATA]) +
+		atomic_read(&DIRTY_I(sbi)->nr_dirty[DIRTY_WARM_DATA]) +
+		atomic_read(&DIRTY_I(sbi)->nr_dirty[DIRTY_COLD_DATA]) +
+		atomic_read(&DIRTY_I(sbi)->nr_dirty[DIRTY_HOT_NODE]) +
+		atomic_read(&DIRTY_I(sbi)->nr_dirty[DIRTY_WARM_NODE]) +
+		atomic_read(&DIRTY_I(sbi)->nr_dirty[DIRTY_COLD_NODE]);
 }
 
 static inline int overprovision_segments(struct f2fs_sb_info *sbi)
@@ -948,6 +962,58 @@ static inline void verify_fio_blkaddr(struct f2fs_io_info *fio)
 /*
  * Summary block is always treated as an invalid block
  */
+/*
+ * DeLFS: check_block_count() variant used when SIT entries are read at
+ * mount (build_sit_entries); also prints the segment number.
+ */
+static inline int my_check_block_count(struct f2fs_sb_info *sbi,
+		int segno, struct f2fs_sit_entry *raw_sit)
+{
+	bool is_valid  = test_bit_le(0, raw_sit->valid_map) ? true : false;
+	int valid_blocks = 0;
+	int cur_pos = 0, next_pos;
+	unsigned int usable_blks_per_seg = f2fs_usable_blks_in_seg(sbi, segno);
+
+	/* check bitmap with valid block count */
+	do {
+		if (is_valid) {
+			next_pos = find_next_zero_bit_le(&raw_sit->valid_map,
+					usable_blks_per_seg,
+					cur_pos);
+			valid_blocks += next_pos - cur_pos;
+		} else
+			next_pos = find_next_bit_le(&raw_sit->valid_map,
+					usable_blks_per_seg,
+					cur_pos);
+		cur_pos = next_pos;
+		is_valid = !is_valid;
+	} while (cur_pos < usable_blks_per_seg);
+
+	if (unlikely(GET_SIT_VBLOCKS(raw_sit) != valid_blocks)) {
+		f2fs_err(sbi, "segno=%d, Mismatch valid blocks %d vs. %d",
+			 segno, GET_SIT_VBLOCKS(raw_sit), valid_blocks);
+		set_sbi_flag(sbi, SBI_NEED_FSCK);
+		f2fs_handle_error(sbi, ERROR_INCONSISTENT_SIT);
+		return -EFSCORRUPTED;
+	}
+
+	if (usable_blks_per_seg < sbi->blocks_per_seg)
+		f2fs_bug_on(sbi, find_next_bit_le(&raw_sit->valid_map,
+				sbi->blocks_per_seg,
+				usable_blks_per_seg) != sbi->blocks_per_seg);
+
+	/* check segment usage, and check boundary of a given segment number */
+	if (unlikely(GET_SIT_VBLOCKS(raw_sit) > usable_blks_per_seg
+					|| !valid_main_segno(sbi, segno))) {
+		f2fs_err(sbi, "Wrong valid blocks %d or segno %u",
+			 GET_SIT_VBLOCKS(raw_sit), segno);
+		set_sbi_flag(sbi, SBI_NEED_FSCK);
+		f2fs_handle_error(sbi, ERROR_INCONSISTENT_SIT);
+		return -EFSCORRUPTED;
+	}
+	return 0;
+}
+
 static inline int check_block_count(struct f2fs_sb_info *sbi,
 		int segno, struct f2fs_sit_entry *raw_sit)
 {
@@ -972,8 +1038,8 @@ static inline int check_block_count(struct f2fs_sb_info *sbi,
 	} while (cur_pos < usable_blks_per_seg);
 
 	if (unlikely(GET_SIT_VBLOCKS(raw_sit) != valid_blocks)) {
-		f2fs_err(sbi, "Mismatch valid blocks %d vs. %d",
-			 GET_SIT_VBLOCKS(raw_sit), valid_blocks);
+		f2fs_err(sbi, "segno=%d, Mismatch valid blocks %d vs. %d",
+			 segno, GET_SIT_VBLOCKS(raw_sit), valid_blocks);
 		set_sbi_flag(sbi, SBI_NEED_FSCK);
 		f2fs_handle_error(sbi, ERROR_INCONSISTENT_SIT);
 		return -EFSCORRUPTED;
@@ -1143,16 +1209,23 @@ static inline void wake_up_discard_thread(struct f2fs_sb_info *sbi, bool force)
 	if (force)
 		goto wake_up;
 
-	mutex_lock(&dcc->cmd_lock);
-	for (i = MAX_PLIST_NUM - 1; i >= 0; i--) {
-		if (i + 1 < dcc->discard_granularity)
-			break;
-		if (!list_empty(&dcc->pend_list[i])) {
-			wakeup = true;
-			break;
+	int dcc_cpu;
+	for_each_online_cpu(dcc_cpu) {
+		struct discard_set *ds = per_cpu_ptr(dcc->ds, dcc_cpu);
+
+		mutex_lock(&ds->p_cmd_lock);
+		for (i = MAX_PLIST_NUM - 1; i >= 0; i--) {
+			if (i + 1 < dcc->discard_granularity)
+				break;
+			if (!list_empty(&ds->p_pend_list[i])) {
+				wakeup = true;
+				break;
+			}
 		}
+		mutex_unlock(&ds->p_cmd_lock);
 	}
-	mutex_unlock(&dcc->cmd_lock);
+
+
 	if (!wakeup || !is_idle(sbi, DISCARD_TIME))
 		return;
 wake_up:
