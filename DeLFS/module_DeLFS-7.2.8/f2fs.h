@@ -1783,8 +1783,8 @@ struct f2fs_gc_kthread {
 };
 
 /*
- * DeLFS per-core bio: one set of write bios (the old sbi->write_io) per CPU.
- * Provisional; to be replaced by A's shared-header commit.
+ * DeLFS per-core bio: one set of write bios (the old sbi->write_io) per CPU,
+ * indexed by fio->cpu.
  */
 struct wrap_f2fs_bio_info {
 	struct f2fs_bio_info *write_io[NR_PAGE_TYPE];
@@ -1817,7 +1817,6 @@ struct f2fs_sb_info {
 	/* for bio operations */
 	/*
 	 * DeLFS per-core bio: sbi->write_io is replaced by a per-CPU set.
-	 * Provisional; to be replaced by A's shared-header commit.
 	 */
 	struct wrap_f2fs_bio_info __percpu *wrap_write_io;	/* for write bios */
 	/* keep migration IO order for LFS mode */
