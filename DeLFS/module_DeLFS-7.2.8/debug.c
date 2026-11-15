@@ -235,7 +235,7 @@ static void update_general_status(struct f2fs_sb_info *sbi)
 	si->nats = NM_I(sbi)->nat_cnt[TOTAL_NAT];
 	si->dirty_nats = NM_I(sbi)->nat_cnt[DIRTY_NAT];
 	si->sits = MAIN_SEGS(sbi);
-	si->dirty_sits = SIT_I(sbi)->dirty_sentries;
+	si->dirty_sits = atomic_read(&SIT_I(sbi)->dirty_sentries);	/* DeLFS (B): atomic */
 	si->free_nids = NM_I(sbi)->nid_cnt[FREE_NID];
 	si->avail_nids = NM_I(sbi)->available_nids;
 	si->alloc_nids = NM_I(sbi)->nid_cnt[PREALLOC_NID];
