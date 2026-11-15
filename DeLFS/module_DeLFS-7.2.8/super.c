@@ -37,6 +37,7 @@
 #include "xattr.h"
 #include "gc.h"
 #include "iostat.h"
+#include "oldinv.h"	/* DeLFS deLLC (B) */
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/f2fs.h>
@@ -2100,6 +2101,13 @@ static void f2fs_put_super(struct super_block *sb)
 		sync_blockdev(FDEV(i).bdev);
 		invalidate_bdev(FDEV(i).bdev);
 	}
+
+	/*
+	 * DeLFS (B) deLLC: stop the old-block invalidation workers. Last
+	 * thing, as in DeLFS 6.6.8 (bug list #5: this is after the SIT is
+	 * freed).
+	 */
+	oldinv_exit(sbi);
 }
 
 int f2fs_sync_fs(struct super_block *sb, int sync)
@@ -5502,6 +5510,9 @@ reset_checkpoint:
 	clear_sbi_flag(sbi, SBI_CP_DISABLED_QUICK);
 
 	sbi->umount_lock_holder = NULL;
+
+	/* DeLFS (B) deLLC: start the old-block invalidation workers */
+	oldinv_init(sbi);
 	return 0;
 
 sync_free_meta:

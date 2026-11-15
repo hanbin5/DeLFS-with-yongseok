@@ -22,6 +22,7 @@
 #include "node.h"
 #include "segment.h"
 #include "iostat.h"
+#include "oldinv.h"	/* DeLFS deLLC (B) */
 #include <trace/events/f2fs.h>
 
 static inline void get_lock_elapsed_time(struct f2fs_time_stat *ts)
@@ -1969,7 +1970,11 @@ int f2fs_write_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 
 	f2fs_flush_merged_writes(sbi);
 
-	/* TODO(B): oldinv_flush_all */
+	/*
+	 * DeLFS (B) deLLC: apply every deferred old-block invalidation to the
+	 * SIT and dirty lists before they are written by this checkpoint.
+	 */
+	oldinv_flush_all(sbi);
 
 	/* this is the case of multiple fstrims without any changes */
 	if (cpc->reason & CP_DISCARD) {
