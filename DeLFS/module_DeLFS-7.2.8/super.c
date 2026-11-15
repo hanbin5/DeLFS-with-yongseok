@@ -2654,9 +2654,15 @@ static int f2fs_disable_checkpoint(struct f2fs_sb_info *sbi)
 			.no_bg_gc = true,
 			.nr_free_secs = 1 };
 
-		f2fs_down_write_trace(&sbi->gc_lock, &gc_control.lc);
+		/* DeLFS: f2fs_gc() takes gc_lock itself, GC every core's region */
 		stat_inc_gc_call_count(sbi, FOREGROUND);
-		err = f2fs_gc(sbi, &gc_control);
+		int cpu;
+		for_each_online_cpu(cpu) {
+			err = f2fs_gc(sbi, &gc_control, cpu);
+			if (err) {
+				break;
+			}
+		}
 		if (err == -ENODATA) {
 			err = 0;
 			break;
