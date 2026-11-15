@@ -7,7 +7,7 @@
  */
 #include <linux/blk-crypto.h>
 #include <linux/fs.h>
-#include <linux/f2fs_fs.h>
+#include "delfs_fs.h"
 #include <linux/stat.h>
 #include <linux/writeback.h>
 #include <linux/blkdev.h>

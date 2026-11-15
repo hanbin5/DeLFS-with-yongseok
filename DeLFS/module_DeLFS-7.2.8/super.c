@@ -20,7 +20,7 @@
 #include <linux/exportfs.h>
 #include <linux/blkdev.h>
 #include <linux/quotaops.h>
-#include <linux/f2fs_fs.h>
+#include "delfs_fs.h"
 #include <linux/sysfs.h>
 #include <linux/quota.h>
 #include <linux/unicode.h>
@@ -505,8 +505,8 @@ static void f2fs_destroy_casefold_cache(void) { }
 
 static inline void limit_reserve_root(struct f2fs_sb_info *sbi)
 {
-	block_t block_limit = min((sbi->user_block_count >> 3),
-			sbi->user_block_count - sbi->reserved_blocks);
+	block_t block_limit = min(((block_t)atomic_read(&sbi->user_block_count) >> 3),
+			(block_t)atomic_read(&sbi->user_block_count) - (block_t)atomic_read(&sbi->reserved_blocks));
 	block_t node_limit = sbi->total_node_count >> 3;
 
 	/* limit is 12.5% */
@@ -541,9 +541,9 @@ static inline void adjust_unusable_cap_perc(struct f2fs_sb_info *sbi)
 		return;
 
 	if (F2FS_OPTION(sbi).unusable_cap_perc == 100)
-		F2FS_OPTION(sbi).unusable_cap = sbi->user_block_count;
+		F2FS_OPTION(sbi).unusable_cap = (block_t)atomic_read(&sbi->user_block_count);
 	else
-		F2FS_OPTION(sbi).unusable_cap = (sbi->user_block_count / 100) *
+		F2FS_OPTION(sbi).unusable_cap = ((block_t)atomic_read(&sbi->user_block_count) / 100) *
 					F2FS_OPTION(sbi).unusable_cap_perc;
 
 	f2fs_info(sbi, "Adjust unusable cap for checkpoint=disable = %u / %u%%",
@@ -2016,7 +2016,7 @@ static void f2fs_put_super(struct super_block *sb)
 
 	/* be sure to wait for any on-going discard commands */
 	done = f2fs_issue_discard_timeout(sbi, true);
-	if (f2fs_realtime_discard_enable(sbi) && !sbi->discard_blks && done) {
+	if (f2fs_realtime_discard_enable(sbi) && !(block_t)atomic_read(&sbi->discard_blks) && done) {
 		struct cp_control cpc = {
 			.reason = CP_UMOUNT | CP_TRIMMED,
 		};
@@ -2239,12 +2239,12 @@ static int f2fs_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 	spin_lock(&sbi->stat_lock);
 	if (sbi->carve_out)
-		buf->f_blocks -= sbi->current_reserved_blocks;
-	user_block_count = sbi->user_block_count;
+		buf->f_blocks -= (block_t)atomic_read(&sbi->current_reserved_blocks);
+	user_block_count = (block_t)atomic_read(&sbi->user_block_count);
 	total_valid_node_count = valid_node_count(sbi);
 	avail_node_count = sbi->total_node_count - F2FS_RESERVED_NODE_NUM;
 	buf->f_bfree = user_block_count - valid_user_blocks(sbi) -
-						sbi->current_reserved_blocks;
+						(block_t)atomic_read(&sbi->current_reserved_blocks);
 
 	if (unlikely(buf->f_bfree <= sbi->unusable_block_count))
 		buf->f_bfree = 0;
@@ -4181,7 +4181,9 @@ int f2fs_sanity_check_ckpt(struct f2fs_sb_info *sbi)
 	block_t avail_node_count, valid_node_count;
 	unsigned int nat_blocks, nat_bits_bytes, nat_bits_blocks;
 	unsigned int sit_blk_cnt;
-	int i, j;
+	unsigned int nr_cpus, cp_blocks, orphan_blocks, sum_blocks, per_cpu;
+	unsigned int max_npages, node_sums;
+	int i, j, k, cpu;
 
 	total = le32_to_cpu(raw_super->segment_count);
 	fsmeta = le32_to_cpu(raw_super->segment_count_ckpt);
@@ -4233,50 +4235,74 @@ int f2fs_sanity_check_ckpt(struct f2fs_sb_info *sbi)
 	main_segs = le32_to_cpu(raw_super->segment_count_main);
 	blocks_per_seg = BLKS_PER_SEG(sbi);
 
-	for (i = 0; i < NR_CURSEG_NODE_TYPE; i++) {
-		if (le32_to_cpu(ckpt->cur_node_segno[i]) >= main_segs ||
-			le16_to_cpu(ckpt->cur_node_blkoff[i]) >= blocks_per_seg)
+	/*
+	 * DeLFS: per-core current segments. Every current segment, node or
+	 * data, of every core must be in range and unique across all cores.
+	 */
+	nr_cpus = num_online_cpus();
+	if (nr_cpus > MAX_CORE_COUNT) {
+		f2fs_err(sbi, "too many online cpus: %u > %d",
+			 nr_cpus, MAX_CORE_COUNT);
+		return 1;
+	}
+	/* TODO(A): cpu ids are used as array index; assumes online cpus are 0..nr_cpus-1 */
+	for_each_online_cpu(cpu) {
+		if (cpu >= nr_cpus) {
+			f2fs_err(sbi, "online cpu ids are not contiguous (cpu %d, %u online)",
+				 cpu, nr_cpus);
 			return 1;
+		}
+	}
 
-		if (f2fs_sb_has_readonly(sbi))
-			goto check_data;
-
-		for (j = i + 1; j < NR_CURSEG_NODE_TYPE; j++) {
-			if (le32_to_cpu(ckpt->cur_node_segno[i]) ==
-				le32_to_cpu(ckpt->cur_node_segno[j])) {
-				f2fs_err(sbi, "Node segment (%u, %u) has the same segno: %u",
-					 i, j,
-					 le32_to_cpu(ckpt->cur_node_segno[i]));
+	for_each_online_cpu(cpu) {
+		for (i = 0; i < NR_CURSEG_NODE_TYPE; i++) {
+			if (le32_to_cpu(ckpt->cur_nodes_segno[cpu][i]) >= main_segs ||
+				le16_to_cpu(ckpt->cur_nodes_blkoff[cpu][i]) >= blocks_per_seg) {
+				f2fs_err(sbi, "cpu %d: invalid node curseg %d: segno %u, blkoff %u",
+					 cpu, i,
+					 le32_to_cpu(ckpt->cur_nodes_segno[cpu][i]),
+					 le16_to_cpu(ckpt->cur_nodes_blkoff[cpu][i]));
+				return 1;
+			}
+		}
+		for (i = 0; i < NR_CURSEG_DATA_TYPE; i++) {
+			if (le32_to_cpu(ckpt->cur_datas_segno[cpu][i]) >= main_segs ||
+				le16_to_cpu(ckpt->cur_datas_blkoff[cpu][i]) >= blocks_per_seg) {
+				f2fs_err(sbi, "cpu %d: invalid data curseg %d: segno %u, blkoff %u",
+					 cpu, i,
+					 le32_to_cpu(ckpt->cur_datas_segno[cpu][i]),
+					 le16_to_cpu(ckpt->cur_datas_blkoff[cpu][i]));
 				return 1;
 			}
 		}
 	}
-check_data:
-	for (i = 0; i < NR_CURSEG_DATA_TYPE; i++) {
-		if (le32_to_cpu(ckpt->cur_data_segno[i]) >= main_segs ||
-			le16_to_cpu(ckpt->cur_data_blkoff[i]) >= blocks_per_seg)
-			return 1;
 
-		if (f2fs_sb_has_readonly(sbi))
-			goto skip_cross;
+	if (f2fs_sb_has_readonly(sbi))
+		goto skip_cross;
 
-		for (j = i + 1; j < NR_CURSEG_DATA_TYPE; j++) {
-			if (le32_to_cpu(ckpt->cur_data_segno[i]) ==
-				le32_to_cpu(ckpt->cur_data_segno[j])) {
-				f2fs_err(sbi, "Data segment (%u, %u) has the same segno: %u",
-					 i, j,
-					 le32_to_cpu(ckpt->cur_data_segno[i]));
-				return 1;
-			}
-		}
-	}
-	for (i = 0; i < NR_CURSEG_NODE_TYPE; i++) {
-		for (j = 0; j < NR_CURSEG_DATA_TYPE; j++) {
-			if (le32_to_cpu(ckpt->cur_node_segno[i]) ==
-				le32_to_cpu(ckpt->cur_data_segno[j])) {
-				f2fs_err(sbi, "Node segment (%u) and Data segment (%u) has the same segno: %u",
-					 i, j,
-					 le32_to_cpu(ckpt->cur_node_segno[i]));
+	/*
+	 * Duplicate check over all (cpu, log) pairs. DeLFS 6.6.8 only checked
+	 * within a core; also check across cores and node <-> data.
+	 * Index k = cpu * NR_CURSEG_PERSIST_TYPE + log (data logs first).
+	 */
+	for (k = 0; k < nr_cpus * NR_CURSEG_PERSIST_TYPE; k++) {
+		int cpu_k = k / NR_CURSEG_PERSIST_TYPE, log_k = k % NR_CURSEG_PERSIST_TYPE;
+		unsigned int segno_k = log_k < NR_CURSEG_DATA_TYPE ?
+			le32_to_cpu(ckpt->cur_datas_segno[cpu_k][log_k]) :
+			le32_to_cpu(ckpt->cur_nodes_segno[cpu_k][log_k - NR_CURSEG_DATA_TYPE]);
+
+		for (j = k + 1; j < nr_cpus * NR_CURSEG_PERSIST_TYPE; j++) {
+			int cpu_j = j / NR_CURSEG_PERSIST_TYPE, log_j = j % NR_CURSEG_PERSIST_TYPE;
+			unsigned int segno_j = log_j < NR_CURSEG_DATA_TYPE ?
+				le32_to_cpu(ckpt->cur_datas_segno[cpu_j][log_j]) :
+				le32_to_cpu(ckpt->cur_nodes_segno[cpu_j][log_j - NR_CURSEG_DATA_TYPE]);
+
+			if (segno_k == segno_j) {
+				f2fs_err(sbi, "%s segment (cpu %d, log %d) and %s segment (cpu %d, log %d) have the same segno: %u",
+					 log_k < NR_CURSEG_DATA_TYPE ? "Data" : "Node",
+					 cpu_k, log_k % NR_CURSEG_DATA_TYPE,
+					 log_j < NR_CURSEG_DATA_TYPE ? "Data" : "Node",
+					 cpu_j, log_j % NR_CURSEG_DATA_TYPE, segno_k);
 				return 1;
 			}
 		}
@@ -4301,11 +4327,42 @@ skip_cross:
 
 	cp_pack_start_sum = __start_sum_addr(sbi);
 	cp_payload = __cp_payload(sbi);
+	/* TODO(A): bounds kept as in DeLFS 6.6.8; could be tightened to F2FS_CP_HDR_BLKS / F2FS_CP_PACK_SEGS layout */
 	if (cp_pack_start_sum < cp_payload + 1 ||
 		cp_pack_start_sum > blocks_per_seg - 1 -
 			NR_CURSEG_PERSIST_TYPE) {
 		f2fs_err(sbi, "Wrong cp_pack_start_sum: %u",
 			 cp_pack_start_sum);
+		return 1;
+	}
+
+	/*
+	 * DeLFS: the summary area of the cp pack is
+	 * (max_npages + node sums) * nr_cpus blocks, so the core count at mount
+	 * must match the one used by mkfs / the last checkpoint.
+	 * cp_pack_start_sum = F2FS_CP_HDR_BLKS + payload + orphan.
+	 */
+	cp_blocks = le32_to_cpu(ckpt->cp_pack_total_block_count);
+	if (cp_pack_start_sum < F2FS_CP_HDR_BLKS + cp_payload ||
+			cp_blocks < cp_pack_start_sum + F2FS_CP_HDR_BLKS) {
+		f2fs_err(sbi, "Wrong cp pack layout: start_sum %u, payload %u, total %u",
+			 cp_pack_start_sum, cp_payload, cp_blocks);
+		return 1;
+	}
+	orphan_blocks = cp_pack_start_sum - F2FS_CP_HDR_BLKS - cp_payload;
+	sum_blocks = cp_blocks - F2FS_CP_PACKS - cp_payload - orphan_blocks;
+	node_sums = (__is_set_ckpt_flags(ckpt, CP_UMOUNT_FLAG) ||
+			__is_set_ckpt_flags(ckpt, CP_FASTBOOT_FLAG)) ?
+					NR_CURSEG_NODE_TYPE : 0;
+	per_cpu = sum_blocks / nr_cpus;
+	max_npages = per_cpu - node_sums;
+	if (sum_blocks % nr_cpus || per_cpu <= node_sums ||
+		(__is_set_ckpt_flags(ckpt, CP_COMPACT_SUM_FLAG) ?
+			max_npages >= NR_CURSEG_DATA_TYPE :
+			max_npages != NR_CURSEG_DATA_TYPE)) {
+		f2fs_err(sbi, "core count mismatch between mkfs and mount: "
+			 "%u summary blocks in cp pack do not fit %u online cpus "
+			 "(node sums/cpu %u)", sum_blocks, nr_cpus, node_sums);
 		return 1;
 	}
 
@@ -5201,12 +5258,11 @@ try_onemore:
 				le32_to_cpu(sbi->ckpt->valid_node_count);
 	percpu_counter_set(&sbi->total_valid_inode_count,
 				le32_to_cpu(sbi->ckpt->valid_inode_count));
-	sbi->user_block_count = le64_to_cpu(sbi->ckpt->user_block_count);
-	sbi->total_valid_block_count =
-				le64_to_cpu(sbi->ckpt->valid_block_count);
-	sbi->last_valid_block_count = sbi->total_valid_block_count;
-	sbi->reserved_blocks = 0;
-	sbi->current_reserved_blocks = 0;
+	atomic_set(&sbi->user_block_count, le64_to_cpu(sbi->ckpt->user_block_count));
+	atomic_set(&sbi->total_valid_block_count, le64_to_cpu(sbi->ckpt->valid_block_count));
+	atomic_set(&sbi->last_valid_block_count, (block_t)atomic_read(&sbi->total_valid_block_count));
+	atomic_set(&sbi->reserved_blocks, 0);
+	atomic_set(&sbi->current_reserved_blocks, 0);
 	limit_reserve_root(sbi);
 	adjust_unusable_cap_perc(sbi);
 
@@ -5253,8 +5309,13 @@ try_onemore:
 			ZONED_PIN_SEC_REQUIRED_COUNT :
 			GET_SEC_FROM_SEG(sbi, overprovision_segments(sbi));
 
-	/* Read accumulated write IO statistics if exists */
-	seg_i = CURSEG_I(sbi, CURSEG_HOT_NODE);
+	/*
+	 * Read accumulated write IO statistics if exists.
+	 * DeLFS: do_checkpoint() stores the same value in the hot node journal
+	 * of every core; read it from the first online core.
+	 */
+	seg_i = WRAP_CURSEG_I(sbi, cpumask_first(cpu_online_mask))->array +
+							CURSEG_HOT_NODE;
 	if (__exist_node_summaries(sbi))
 		sbi->kbytes_written =
 			le64_to_cpu(seg_i->journal->info.kbytes_written);

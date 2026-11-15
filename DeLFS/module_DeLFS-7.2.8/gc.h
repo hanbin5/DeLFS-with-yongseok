@@ -154,7 +154,7 @@ static inline bool has_enough_free_blocks(struct f2fs_sb_info *sbi,
 
 static inline bool has_enough_invalid_blocks(struct f2fs_sb_info *sbi)
 {
-	block_t user_block_count = sbi->user_block_count;
+	block_t user_block_count = (block_t)atomic_read(&sbi->user_block_count);
 	block_t invalid_user_blocks = user_block_count -
 		written_block_count(sbi);
 	/*

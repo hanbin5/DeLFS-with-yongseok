@@ -8,7 +8,7 @@
 #include <linux/fs.h>
 #include <linux/module.h>
 #include <linux/init.h>
-#include <linux/f2fs_fs.h>
+#include "delfs_fs.h"
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/freezer.h>
@@ -2402,8 +2402,8 @@ int f2fs_resize_fs(struct file *filp, __u64 block_count)
 
 	spin_lock(&sbi->stat_lock);
 	if (shrunk_blocks + valid_user_blocks(sbi) +
-		sbi->current_reserved_blocks + sbi->unusable_block_count +
-		F2FS_OPTION(sbi).root_reserved_blocks > sbi->user_block_count)
+		(block_t)atomic_read(&sbi->current_reserved_blocks) + sbi->unusable_block_count +
+		F2FS_OPTION(sbi).root_reserved_blocks > (block_t)atomic_read(&sbi->user_block_count))
 		err = -ENOSPC;
 	spin_unlock(&sbi->stat_lock);
 
@@ -2436,11 +2436,11 @@ out_drop_write:
 
 	spin_lock(&sbi->stat_lock);
 	if (shrunk_blocks + valid_user_blocks(sbi) +
-		sbi->current_reserved_blocks + sbi->unusable_block_count +
-		F2FS_OPTION(sbi).root_reserved_blocks > sbi->user_block_count)
+		(block_t)atomic_read(&sbi->current_reserved_blocks) + sbi->unusable_block_count +
+		F2FS_OPTION(sbi).root_reserved_blocks > (block_t)atomic_read(&sbi->user_block_count))
 		err = -ENOSPC;
 	else
-		sbi->user_block_count -= shrunk_blocks;
+		atomic_sub(shrunk_blocks, &sbi->user_block_count);
 	spin_unlock(&sbi->stat_lock);
 	if (err)
 		goto out_err;
@@ -2476,7 +2476,7 @@ recover_out:
 		f2fs_err(sbi, "resize_fs failed, should run fsck to repair!");
 
 		spin_lock(&sbi->stat_lock);
-		sbi->user_block_count += shrunk_blocks;
+		atomic_add(shrunk_blocks, &sbi->user_block_count);
 		spin_unlock(&sbi->stat_lock);
 	}
 out_err:

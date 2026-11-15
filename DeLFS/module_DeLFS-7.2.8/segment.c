@@ -6,7 +6,7 @@
  *             http://www.samsung.com/
  */
 #include <linux/fs.h>
-#include <linux/f2fs_fs.h>
+#include "delfs_fs.h"
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/sched/mm.h>
@@ -32,6 +32,91 @@ static struct kmem_cache *discard_entry_slab;
 static struct kmem_cache *discard_cmd_slab;
 static struct kmem_cache *sit_entry_set_slab;
 static struct kmem_cache *revoke_entry_slab;
+
+/*
+ * DeLFS: the main area is split into num_online_cpus() equal ranges of
+ * segments; core c "owns" (takes the sentry lock of) segments in its range,
+ * and the last core also owns the remainder.
+ */
+int segno_to_sentry_cpu(struct f2fs_sb_info *sbi, unsigned int segno)
+{
+	int max_cpu = num_online_cpus();
+	unsigned int segs_per_core = MAIN_SEGS(sbi) / max_cpu;
+	int sentry_cpu;
+
+	/* main_segs < max_cpu: everything belongs to the last core */
+	if (!segs_per_core)
+		return max_cpu - 1;
+
+	sentry_cpu = segno / segs_per_core;
+	if (sentry_cpu >= max_cpu)
+		sentry_cpu = max_cpu - 1;
+	return sentry_cpu;
+}
+
+/* DeLFS: [*start, *end] segment range owned by core @c (inclusive) */
+static inline void __maybe_unused sentry_cpu_to_seg_range(int c, int max_cpu,
+			int main_segs, unsigned int *start, unsigned int *end)
+{
+	int segs_per_core = main_segs / max_cpu;
+
+	if (segs_per_core == 0) {
+		*start = 0;
+		*end = main_segs ? main_segs - 1 : 0;
+		return;
+	}
+
+	if (c < 0)
+		c = 0;
+	if (c >= max_cpu)
+		c = max_cpu - 1;
+
+	*start = (unsigned int)(c * segs_per_core);
+	if (c == max_cpu - 1)
+		*end = (unsigned int)(main_segs - 1);
+	else
+		*end = (unsigned int)((c + 1) * segs_per_core - 1);
+}
+
+void get_sentry_range_from_cpu(struct f2fs_sb_info *sbi, int cpu,
+				unsigned int *sentry_begin,
+				unsigned int *sentry_end)
+{
+	int max_cpu = num_online_cpus();
+	int main_segs = MAIN_SEGS(sbi);
+	int segs_per_core;
+
+	if (!sentry_begin || !sentry_end)
+		return;
+
+	if (max_cpu <= 0 || main_segs <= 0) {
+		*sentry_begin = 0;
+		*sentry_end = 0;
+		return;
+	}
+
+	segs_per_core = main_segs / max_cpu;
+
+	/* same clamping rule as segno_to_sentry_cpu() */
+	if (cpu < 0)
+		cpu = 0;
+	if (cpu >= max_cpu)
+		cpu = max_cpu - 1;
+
+	if (segs_per_core == 0) {
+		/* the last core owns all segments, the others own none */
+		*sentry_begin = 0;
+		*sentry_end = (cpu == max_cpu - 1) ? main_segs - 1 :
+							(unsigned int)-1;
+		return;
+	}
+
+	*sentry_begin = (unsigned int)(cpu * segs_per_core);
+	if (cpu == max_cpu - 1)
+		*sentry_end = (unsigned int)(main_segs - 1);
+	else
+		*sentry_end = (unsigned int)((cpu + 1) * segs_per_core - 1);
+}
 
 static unsigned long __reverse_ulong(unsigned char *str)
 {
@@ -2080,7 +2165,7 @@ static int f2fs_issue_discard(struct f2fs_sb_info *sbi,
 
 		if (f2fs_block_unit_discard(sbi) &&
 				!f2fs_test_and_set_bit(offset, se->discard_map))
-			sbi->discard_blks--;
+			atomic_dec(&sbi->discard_blks);
 	}
 
 	if (len)
@@ -2482,7 +2567,7 @@ static int update_sit_entry_for_release(struct f2fs_sb_info *sbi, struct seg_ent
 
 		if (f2fs_block_unit_discard(sbi) &&
 				f2fs_test_and_clear_bit(offset + i, se->discard_map))
-			sbi->discard_blks++;
+			atomic_inc(&sbi->discard_blks);
 
 		if (!f2fs_test_bit(offset + i, se->ckpt_valid_map)) {
 			se->ckpt_valid_blocks -= 1;
@@ -2512,7 +2597,7 @@ static int update_sit_entry_for_alloc(struct f2fs_sb_info *sbi, struct seg_entry
 
 	if (f2fs_block_unit_discard(sbi) &&
 			!f2fs_test_and_set_bit(offset, se->discard_map))
-		sbi->discard_blks--;
+		atomic_dec(&sbi->discard_blks);
 
 	/*
 	 * SSR should never reuse block which is checkpointed
@@ -2643,9 +2728,12 @@ bool f2fs_is_checkpointed_data(struct f2fs_sb_info *sbi, block_t blkaddr)
 	return is_cp;
 }
 
-static unsigned short f2fs_curseg_valid_blocks(struct f2fs_sb_info *sbi, int type)
+/* DeLFS: valid summary entries of @cpu's curseg @type */
+static unsigned short f2fs_curseg_valid_blocks(struct f2fs_sb_info *sbi,
+						int type, int cpu)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+	struct curseg_info *curseg = cpu_array->array + type;
 
 	if (sbi->ckpt->alloc_type[type] == SSR)
 		return BLKS_PER_SEG(sbi);
@@ -2653,9 +2741,10 @@ static unsigned short f2fs_curseg_valid_blocks(struct f2fs_sb_info *sbi, int typ
 }
 
 /*
- * Calculate the number of current summary pages for writing
+ * Calculate the number of current summary pages of @cpu for writing
  */
-int f2fs_npages_for_summary_flush(struct f2fs_sb_info *sbi, bool for_ra)
+int percore_f2fs_npages_for_summary_flush(struct f2fs_sb_info *sbi,
+						bool for_ra, int cpu)
 {
 	int valid_sum_count = 0;
 	int i, sum_in_page;
@@ -2663,9 +2752,9 @@ int f2fs_npages_for_summary_flush(struct f2fs_sb_info *sbi, bool for_ra)
 	for (i = CURSEG_HOT_DATA; i <= CURSEG_COLD_DATA; i++) {
 		if (sbi->ckpt->alloc_type[i] != SSR && for_ra)
 			valid_sum_count +=
-				le16_to_cpu(F2FS_CKPT(sbi)->cur_data_blkoff[i]);
+				le16_to_cpu(F2FS_CKPT(sbi)->cur_datas_blkoff[cpu][i]);
 		else
-			valid_sum_count += f2fs_curseg_valid_blocks(sbi, i);
+			valid_sum_count += f2fs_curseg_valid_blocks(sbi, i, cpu);
 	}
 
 	sum_in_page = (sbi->blocksize - 2 * sbi->sum_journal_size -
@@ -2726,9 +2815,10 @@ static void write_sum_page(struct f2fs_sb_info *sbi,
 }
 
 static void write_current_sum_page(struct f2fs_sb_info *sbi,
-						int type, block_t blk_addr)
+						int type, block_t blk_addr,
+						struct curseg_info_array *cpu_array)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	struct curseg_info *curseg = cpu_array->array + type;
 	struct folio *folio = f2fs_grab_meta_folio(sbi, blk_addr);
 	struct f2fs_summary_block *src = curseg->sum_blk;
 	struct f2fs_summary_block *dst;
@@ -2751,7 +2841,8 @@ static void write_current_sum_page(struct f2fs_sb_info *sbi,
 	f2fs_folio_put(folio, true);
 }
 
-static int is_next_segment_free(struct f2fs_sb_info *sbi,
+/* DeLFS: unused since need_new_seg() always allocates a new segment (LFS only) */
+static int __maybe_unused is_next_segment_free(struct f2fs_sb_info *sbi,
 				struct curseg_info *curseg)
 {
 	unsigned int segno = curseg->segno + 1;
@@ -2766,9 +2857,15 @@ static int is_next_segment_free(struct f2fs_sb_info *sbi,
  * Find a new segment from the free segments bitmap to right order
  * This function should be returned with success, otherwise BUG
  */
+/*
+ * DeLFS: search to the right of the hint (@cpu's curseg->segno) and wrap to
+ * the beginning. The search is not limited to @cpu's own segment range, so
+ * a core borrows segments of other ranges once its own range is full.
+ */
 static int get_new_segment(struct f2fs_sb_info *sbi,
-			unsigned int *newseg, bool new_sec, bool pinning)
+			unsigned int *newseg, bool new_sec, bool pinning, int cpu)
 {
+	struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
 	struct free_segmap_info *free_i = FREE_I(sbi);
 	unsigned int segno, secno, zoneno;
 	unsigned int total_zones = MAIN_SECS(sbi) / sbi->secs_per_zone;
@@ -2863,8 +2960,12 @@ find_other_zone:
 		goto got_it;
 	if (zoneno == old_zoneno)
 		goto got_it;
+	/*
+	 * TODO(A): like DeLFS, only @cpu's own cursegs are checked here;
+	 * other cores' cursegs may still use @zoneno (secs_per_zone > 1 only).
+	 */
 	for (i = 0; i < NR_CURSEG_TYPE; i++)
-		if (CURSEG_I(sbi, i)->zone == zoneno)
+		if ((cpu_array->array + i)->zone == zoneno)
 			break;
 
 	if (i < NR_CURSEG_TYPE) {
@@ -2901,18 +3002,41 @@ out_unlock:
 	return ret;
 }
 
-static void reset_curseg(struct f2fs_sb_info *sbi, int type, int modified)
+/*
+ * DeLFS: switch @cpu's curseg @type to its next_segno. The new segment's
+ * curseg ref is taken before curseg->segno is published, and the old
+ * segment's ref is dropped only afterwards, so is_curseg()/is_cursec()
+ * never see a window in which neither segment is current.
+ */
+static void reset_curseg(struct f2fs_sb_info *sbi, int type, int modified,
+			int cpu, struct curseg_info_array *cpu_array)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	struct curseg_info *curseg = cpu_array->array + type;
 	struct summary_footer *sum_footer;
 	unsigned short seg_type = curseg->seg_type;
+	unsigned int old_segno = curseg->segno;
+	unsigned int new_segno = curseg->next_segno;
 
 	/* only happen when get_new_segment() fails */
-	if (curseg->next_segno == NULL_SEGNO)
+	if (new_segno == NULL_SEGNO)
 		return;
 
 	curseg->inited = true;
-	curseg->segno = curseg->next_segno;
+
+	/* 1) get ref on the new current segment */
+	if (new_segno != old_segno)
+		f2fs_curseg_get(sbi, new_segno);
+	atomic_set(&get_seg_entry(sbi, new_segno)->curseg_cpu, cpu); /* debug only */
+
+	/* 2) publish the new segno */
+	WRITE_ONCE(curseg->segno, new_segno);
+
+	/* 3) drop ref on the old current segment */
+	if (old_segno != NULL_SEGNO && old_segno != new_segno) {
+		atomic_set(&get_seg_entry(sbi, old_segno)->curseg_cpu, -1); /* debug only */
+		f2fs_curseg_put(sbi, old_segno);
+	}
+
 	curseg->zone = GET_ZONE_FROM_SEG(sbi, curseg->segno);
 	curseg->next_blkoff = 0;
 	curseg->next_segno = NULL_SEGNO;
@@ -2929,9 +3053,17 @@ static void reset_curseg(struct f2fs_sb_info *sbi, int type, int modified)
 	__set_sit_entry_type(sbi, seg_type, curseg->segno, modified);
 }
 
-static unsigned int __get_next_segno(struct f2fs_sb_info *sbi, int type)
+/*
+ * DeLFS: always use @cpu's current segno as the hint, so that every core
+ * keeps allocating near its own position. (Vanilla returns 0 for HOT_DATA
+ * and node logs, and last_victim[ALLOC_NEXT] / 0 for ALLOC_MODE_REUSE,
+ * which would pile all cores up around segment 0.)
+ */
+static unsigned int __get_next_segno(struct f2fs_sb_info *sbi, int type,
+								int cpu)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+	struct curseg_info *curseg = cpu_array->array + type;
 	unsigned short seg_type = curseg->seg_type;
 
 	sanity_check_seg_type(sbi, seg_type);
@@ -2956,16 +3088,6 @@ static unsigned int __get_next_segno(struct f2fs_sb_info *sbi, int type)
 	if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED)))
 		return 0;
 
-	if (seg_type == CURSEG_HOT_DATA || IS_NODESEG(seg_type))
-		return 0;
-
-	if (SIT_I(sbi)->last_victim[ALLOC_NEXT])
-		return SIT_I(sbi)->last_victim[ALLOC_NEXT];
-
-	/* find segments from 0 to reuse freed segments */
-	if (F2FS_OPTION(sbi).alloc_mode == ALLOC_MODE_REUSE)
-		return 0;
-
 	return curseg->segno;
 }
 
@@ -2977,12 +3099,29 @@ static void reset_curseg_fields(struct curseg_info *curseg)
 }
 
 /*
+ * DeLFS: like reset_curseg_fields(), but for a live curseg: drop its curseg
+ * ref first, so that the segment stops being "current" (curseg_refs).
+ */
+static void release_curseg(struct f2fs_sb_info *sbi, struct curseg_info *curseg)
+{
+	unsigned int segno = curseg->segno;
+
+	if (curseg->inited && segno != NULL_SEGNO) {
+		WRITE_ONCE(curseg->segno, NULL_SEGNO);
+		atomic_set(&get_seg_entry(sbi, segno)->curseg_cpu, -1); /* debug only */
+		f2fs_curseg_put(sbi, segno);
+	}
+	reset_curseg_fields(curseg);
+}
+
+/*
  * Allocate a current working segment.
  * This function always allocates a free segment in LFS manner.
  */
-static int new_curseg(struct f2fs_sb_info *sbi, int type, bool new_sec)
+static int new_curseg(struct f2fs_sb_info *sbi, int type, bool new_sec, int cpu)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+	struct curseg_info *curseg = cpu_array->array + type;
 	unsigned int segno = curseg->segno;
 	bool pinning = type == CURSEG_COLD_DATA_PINNED;
 	int ret;
@@ -2990,16 +3129,17 @@ static int new_curseg(struct f2fs_sb_info *sbi, int type, bool new_sec)
 	if (curseg->inited)
 		write_sum_page(sbi, curseg->sum_blk, segno);
 
-	segno = __get_next_segno(sbi, type);
-	ret = get_new_segment(sbi, &segno, new_sec, pinning);
+	segno = __get_next_segno(sbi, type, cpu);
+	ret = get_new_segment(sbi, &segno, new_sec, pinning, cpu);
 	if (ret) {
+		/* DeLFS: drop the curseg ref of the abandoned segment as well */
 		if (ret == -ENOSPC)
-			reset_curseg_fields(curseg);
+			release_curseg(sbi, curseg);
 		return ret;
 	}
 
 	curseg->next_segno = segno;
-	reset_curseg(sbi, type, 1);
+	reset_curseg(sbi, type, 1, cpu, cpu_array);
 	curseg->alloc_type = LFS;
 	if (f2fs_need_rand_blk(sbi, type))
 		curseg->fragment_remained_chunk =
@@ -3038,10 +3178,11 @@ bool f2fs_segment_has_free_slot(struct f2fs_sb_info *sbi, int segno)
  * This function always allocates a used segment(from dirty seglist) by SSR
  * manner, so it should recover the existing segment information of valid blocks
  */
-static int change_curseg(struct f2fs_sb_info *sbi, int type)
+static int change_curseg(struct f2fs_sb_info *sbi, int type, int cpu)
 {
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+	struct curseg_info *curseg = cpu_array->array + type;
 	unsigned int new_segno = curseg->next_segno;
 	struct f2fs_summary_block *sum_node;
 	struct folio *sum_folio;
@@ -3051,12 +3192,17 @@ static int change_curseg(struct f2fs_sb_info *sbi, int type)
 
 	__set_test_and_inuse(sbi, new_segno);
 
+	/*
+	 * TODO(B): DeLFS(module_DeLFS/segment.c:4157 change_curseg) takes the
+	 * per-core p_seglist_lock of segno_to_sentry_cpu(new_segno) instead of
+	 * the global seglist_lock.
+	 */
 	mutex_lock(&dirty_i->seglist_lock);
 	__remove_dirty_segment(sbi, new_segno, PRE);
 	__remove_dirty_segment(sbi, new_segno, DIRTY);
 	mutex_unlock(&dirty_i->seglist_lock);
 
-	reset_curseg(sbi, type, 1);
+	reset_curseg(sbi, type, 1, cpu, cpu_array);
 	curseg->alloc_type = SSR;
 	curseg->next_blkoff = __next_free_blkoff(sbi, curseg->segno, 0);
 
@@ -3073,49 +3219,59 @@ static int change_curseg(struct f2fs_sb_info *sbi, int type)
 }
 
 static int get_ssr_segment(struct f2fs_sb_info *sbi, int type,
-				int alloc_mode, unsigned long long age);
+			int alloc_mode, unsigned long long age, int cpu);
 
 static int get_atssr_segment(struct f2fs_sb_info *sbi, int type,
 					int target_type, int alloc_mode,
-					unsigned long long age)
+					unsigned long long age, int cpu)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+	struct curseg_info *curseg = cpu_array->array + type;
 	int ret = 0;
 
 	curseg->seg_type = target_type;
 
-	if (get_ssr_segment(sbi, type, alloc_mode, age)) {
+	if (get_ssr_segment(sbi, type, alloc_mode, age, cpu)) {
 		struct seg_entry *se = get_seg_entry(sbi, curseg->next_segno);
 
 		curseg->seg_type = se->type;
-		ret = change_curseg(sbi, type);
+		ret = change_curseg(sbi, type, cpu);
 	} else {
 		/* allocate cold segment by default */
 		curseg->seg_type = CURSEG_COLD_DATA;
-		ret = new_curseg(sbi, type, true);
+		ret = new_curseg(sbi, type, true, cpu);
 	}
 	stat_inc_seg_type(sbi, curseg);
 	return ret;
 }
 
+/* DeLFS: every online core has its own ATGC curseg */
 static int __f2fs_init_atgc_curseg(struct f2fs_sb_info *sbi, bool force)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, CURSEG_ALL_DATA_ATGC);
-	int ret = 0;
+	int cpu, ret = 0;
 
 	if (!sbi->am.atgc_enabled && !force)
 		return 0;
 
 	f2fs_down_read(&SM_I(sbi)->curseg_lock);
 
-	mutex_lock(&curseg->curseg_mutex);
-	down_write(&SIT_I(sbi)->sentry_lock);
+	for_each_online_cpu(cpu) {
+		struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+		struct curseg_info *curseg =
+				cpu_array->array + CURSEG_ALL_DATA_ATGC;
 
-	ret = get_atssr_segment(sbi, CURSEG_ALL_DATA_ATGC,
-					CURSEG_COLD_DATA, SSR, 0);
+		mutex_lock(&curseg->curseg_mutex);
+		/* TODO(B): DeLFS has no global sentry_lock (per-core sentry locks) */
+		down_write(&SIT_I(sbi)->sentry_lock);
 
-	up_write(&SIT_I(sbi)->sentry_lock);
-	mutex_unlock(&curseg->curseg_mutex);
+		ret = get_atssr_segment(sbi, CURSEG_ALL_DATA_ATGC,
+					CURSEG_COLD_DATA, SSR, 0, cpu);
+
+		up_write(&SIT_I(sbi)->sentry_lock);
+		mutex_unlock(&curseg->curseg_mutex);
+		if (ret)
+			break;
+	}
 
 	f2fs_up_read(&SM_I(sbi)->curseg_lock);
 	return ret;
@@ -3146,23 +3302,30 @@ int f2fs_reinit_atgc_curseg(struct f2fs_sb_info *sbi)
 	return ret;
 }
 
+/* DeLFS: inmem cursegs (pinned/ATGC) are per-core as well */
 static void __f2fs_save_inmem_curseg(struct f2fs_sb_info *sbi, int type)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	int cpu;
 
-	mutex_lock(&curseg->curseg_mutex);
-	if (!curseg->inited)
-		goto out;
+	for_each_online_cpu(cpu) {
+		struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+		struct curseg_info *curseg = cpu_array->array + type;
 
-	if (get_valid_blocks(sbi, curseg->segno, false)) {
-		write_sum_page(sbi, curseg->sum_blk, curseg->segno);
-	} else {
-		mutex_lock(&DIRTY_I(sbi)->seglist_lock);
-		__set_test_and_free(sbi, curseg->segno, true);
-		mutex_unlock(&DIRTY_I(sbi)->seglist_lock);
-	}
+		mutex_lock(&curseg->curseg_mutex);
+		if (!curseg->inited)
+			goto out;
+
+		if (get_valid_blocks(sbi, curseg->segno, false)) {
+			write_sum_page(sbi, curseg->sum_blk, curseg->segno);
+		} else {
+			/* TODO(B): DeLFS dropped seglist_lock with the per-core dirty seglist */
+			mutex_lock(&DIRTY_I(sbi)->seglist_lock);
+			__set_test_and_free(sbi, curseg->segno, true);
+			mutex_unlock(&DIRTY_I(sbi)->seglist_lock);
+		}
 out:
-	mutex_unlock(&curseg->curseg_mutex);
+		mutex_unlock(&curseg->curseg_mutex);
+	}
 }
 
 void f2fs_save_inmem_curseg(struct f2fs_sb_info *sbi)
@@ -3175,19 +3338,25 @@ void f2fs_save_inmem_curseg(struct f2fs_sb_info *sbi)
 
 static void __f2fs_restore_inmem_curseg(struct f2fs_sb_info *sbi, int type)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	int cpu;
 
-	mutex_lock(&curseg->curseg_mutex);
-	if (!curseg->inited)
-		goto out;
-	if (get_valid_blocks(sbi, curseg->segno, false))
-		goto out;
+	for_each_online_cpu(cpu) {
+		struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+		struct curseg_info *curseg = cpu_array->array + type;
 
-	mutex_lock(&DIRTY_I(sbi)->seglist_lock);
-	__set_test_and_inuse(sbi, curseg->segno);
-	mutex_unlock(&DIRTY_I(sbi)->seglist_lock);
+		mutex_lock(&curseg->curseg_mutex);
+		if (!curseg->inited)
+			goto out;
+		if (get_valid_blocks(sbi, curseg->segno, false))
+			goto out;
+
+		/* TODO(B): DeLFS dropped seglist_lock with the per-core dirty seglist */
+		mutex_lock(&DIRTY_I(sbi)->seglist_lock);
+		__set_test_and_inuse(sbi, curseg->segno);
+		mutex_unlock(&DIRTY_I(sbi)->seglist_lock);
 out:
-	mutex_unlock(&curseg->curseg_mutex);
+		mutex_unlock(&curseg->curseg_mutex);
+	}
 }
 
 void f2fs_restore_inmem_curseg(struct f2fs_sb_info *sbi)
@@ -3199,9 +3368,10 @@ void f2fs_restore_inmem_curseg(struct f2fs_sb_info *sbi)
 }
 
 static int get_ssr_segment(struct f2fs_sb_info *sbi, int type,
-				int alloc_mode, unsigned long long age)
+			int alloc_mode, unsigned long long age, int cpu)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+	struct curseg_info *curseg = cpu_array->array + type;
 	unsigned segno = NULL_SEGNO;
 	unsigned short seg_type = curseg->seg_type;
 	int i, cnt;
@@ -3256,60 +3426,69 @@ static int get_ssr_segment(struct f2fs_sb_info *sbi, int type,
 	return 0;
 }
 
-static bool need_new_seg(struct f2fs_sb_info *sbi, int type)
+/*
+ * DeLFS: always allocate a new segment (LFS only, no SSR). ckpt->alloc_type[]
+ * is shared by all cores, so SSR must not be re-enabled here.
+ */
+static bool need_new_seg(struct f2fs_sb_info *sbi, int type, int cpu)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
-
-	if (!is_set_ckpt_flags(sbi, CP_CRC_RECOVERY_FLAG) &&
-	    curseg->seg_type == CURSEG_WARM_NODE)
-		return true;
-	if (curseg->alloc_type == LFS && is_next_segment_free(sbi, curseg) &&
-	    likely(!is_sbi_flag_set(sbi, SBI_CP_DISABLED)))
-		return true;
-	if (!f2fs_need_SSR(sbi) || !get_ssr_segment(sbi, type, SSR, 0))
-		return true;
-	return false;
+	return true;
 }
 
+/*
+ * DeLFS: move every core's curseg @type out of [start, end]. (DeLFS 6.6.8
+ * only handled the curseg of the calling core.)
+ */
 int f2fs_allocate_segment_for_resize(struct f2fs_sb_info *sbi, int type,
 					unsigned int start, unsigned int end)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
-	unsigned int segno;
-	int ret = 0;
+	int cpu, ret = 0;
 
 	f2fs_down_read(&SM_I(sbi)->curseg_lock);
-	mutex_lock(&curseg->curseg_mutex);
-	down_write(&SIT_I(sbi)->sentry_lock);
 
-	segno = CURSEG_I(sbi, type)->segno;
-	if (segno < start || segno > end)
-		goto unlock;
+	for_each_online_cpu(cpu) {
+		struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+		struct curseg_info *curseg = cpu_array->array + type;
+		unsigned int segno;
 
-	if (f2fs_need_SSR(sbi) && get_ssr_segment(sbi, type, SSR, 0))
-		ret = change_curseg(sbi, type);
-	else
-		ret = new_curseg(sbi, type, true);
+		mutex_lock(&curseg->curseg_mutex);
+		/* TODO(B): DeLFS has no global sentry_lock (per-core sentry locks) */
+		down_write(&SIT_I(sbi)->sentry_lock);
 
-	stat_inc_seg_type(sbi, curseg);
+		segno = curseg->segno;
+		if (segno < start || segno > end)
+			goto unlock;
 
-	locate_dirty_segment(sbi, segno);
+		if (f2fs_need_SSR(sbi) && get_ssr_segment(sbi, type, SSR, 0, cpu))
+			ret = change_curseg(sbi, type, cpu);
+		else
+			ret = new_curseg(sbi, type, true, cpu);
+
+		stat_inc_seg_type(sbi, curseg);
+
+		locate_dirty_segment(sbi, segno);
 unlock:
-	up_write(&SIT_I(sbi)->sentry_lock);
+		up_write(&SIT_I(sbi)->sentry_lock);
 
-	if (segno != curseg->segno)
-		f2fs_notice(sbi, "For resize: curseg of type %d: %u ==> %u",
-			    type, segno, curseg->segno);
+		if (segno != curseg->segno)
+			f2fs_notice(sbi, "For resize: cpu %d curseg of type %d: %u ==> %u",
+				    cpu, type, segno, curseg->segno);
 
-	mutex_unlock(&curseg->curseg_mutex);
+		mutex_unlock(&curseg->curseg_mutex);
+		if (ret)
+			break;
+	}
+
 	f2fs_up_read(&SM_I(sbi)->curseg_lock);
 	return ret;
 }
 
-static int __allocate_new_segment(struct f2fs_sb_info *sbi, int type,
-						bool new_sec, bool force)
+/* DeLFS: allocate a new segment for @cpu's curseg @type */
+static int __allocate_new_segment_cpu(struct f2fs_sb_info *sbi, int type,
+				bool new_sec, bool force, int cpu)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+	struct curseg_info *curseg = cpu_array->array + type;
 	unsigned int old_segno;
 	int err = 0;
 
@@ -3324,12 +3503,25 @@ static int __allocate_new_segment(struct f2fs_sb_info *sbi, int type,
 
 allocate:
 	old_segno = curseg->segno;
-	err = new_curseg(sbi, type, true);
+	err = new_curseg(sbi, type, true, cpu);
 	if (err)
 		return err;
 	stat_inc_seg_type(sbi, curseg);
 	locate_dirty_segment(sbi, old_segno);
 	return 0;
+}
+
+/*
+ * DeLFS: callers without a target core use the core they run on.
+ * TODO(A): e.g. f2fs_allocate_pinning_section() allocates the pinned section
+ * for the calling core only; the pinned file may later be written from
+ * another core whose CURSEG_COLD_DATA_PINNED has no section.
+ */
+static int __allocate_new_segment(struct f2fs_sb_info *sbi, int type,
+						bool new_sec, bool force)
+{
+	return __allocate_new_segment_cpu(sbi, type, new_sec, force,
+						raw_smp_processor_id());
 }
 
 int f2fs_allocate_new_section(struct f2fs_sb_info *sbi, int type, bool force)
@@ -3373,13 +3565,16 @@ retry:
 
 int f2fs_allocate_new_segments(struct f2fs_sb_info *sbi)
 {
-	int i;
+	int i, cpu;
 	int err = 0;
 
 	f2fs_down_read(&SM_I(sbi)->curseg_lock);
+	/* TODO(B): DeLFS takes all per-core sentry locks here */
 	down_write(&SIT_I(sbi)->sentry_lock);
-	for (i = CURSEG_HOT_DATA; i <= CURSEG_COLD_DATA; i++)
-		err += __allocate_new_segment(sbi, i, false, false);
+	/* DeLFS: every online core's data cursegs */
+	for_each_online_cpu(cpu)
+		for (i = CURSEG_HOT_DATA; i <= CURSEG_COLD_DATA; i++)
+			err += __allocate_new_segment_cpu(sbi, i, false, false, cpu);
 	up_write(&SIT_I(sbi)->sentry_lock);
 	f2fs_up_read(&SM_I(sbi)->curseg_lock);
 
@@ -3511,7 +3706,7 @@ int f2fs_trim_fs(struct f2fs_sb_info *sbi, struct fstrim_range *range)
 	cpc.trim_start = start_segno;
 	cpc.trim_end = end_segno;
 
-	if (sbi->discard_blks == 0)
+	if ((block_t)atomic_read(&sbi->discard_blks) == 0)
 		goto out;
 
 	f2fs_down_write_trace(&sbi->gc_lock, &lc);
@@ -3721,7 +3916,16 @@ static int __get_segment_type_6(struct f2fs_io_info *fio)
 enum temp_type f2fs_get_segment_temp(struct f2fs_sb_info *sbi,
 						enum log_type type)
 {
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	/*
+	 * DeLFS: seg_type of a log type is the same on every core except the
+	 * ATGC log (set per core by get_atssr_segment()), so look at the
+	 * calling core.
+	 * TODO(A): for CURSEG_ALL_DATA_ATGC the result may differ from the core
+	 * that eventually allocates the block.
+	 */
+	struct curseg_info_array *cpu_array =
+			WRAP_CURSEG_I(sbi, raw_smp_processor_id());
+	struct curseg_info *curseg = cpu_array->array + type;
 	enum temp_type temp = COLD;
 
 	switch (curseg->seg_type) {
@@ -3786,7 +3990,13 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct folio *folio,
 		struct f2fs_io_info *fio)
 {
 	struct sit_info *sit_i = SIT_I(sbi);
-	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	/*
+	 * DeLFS: allocate from the cursegs of the core we run on. The task may
+	 * migrate afterwards; curseg_mutex serializes users of this curseg.
+	 */
+	int cpu = raw_smp_processor_id();
+	struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+	struct curseg_info *curseg = cpu_array->array + type;
 	unsigned long long old_mtime;
 	bool from_gc = (type == CURSEG_ALL_DATA_ATGC);
 	struct seg_entry *se = NULL;
@@ -3796,6 +4006,13 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct folio *folio,
 	f2fs_down_read(&SM_I(sbi)->curseg_lock);
 
 	mutex_lock(&curseg->curseg_mutex);
+	/*
+	 * TODO(B): DeLFS(module_DeLFS/segment.c:4914 f3fs_allocate_data_block)
+	 * takes no sentry lock here. It releases curseg_mutex first and then
+	 * takes the sentry lock of the owner core segno_to_sentry_cpu(new_segno)
+	 * (lock order: curseg_lock(read) -> curseg_mutex -> (unlock) -> owner
+	 * sentry lock).
+	 */
 	down_write(&sit_i->sentry_lock);
 
 	if (curseg->segno == NULL_SEGNO) {
@@ -3838,6 +4055,14 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct folio *folio,
 	/*
 	 * SIT information should be updated before segment allocation,
 	 * since SSR needs latest valid block information.
+	 *
+	 * TODO(B): DeLFS(segment.c:4914) updates mtime/SIT of the new block and
+	 * locate_dirty_segment(new_segno) only after mutex_unlock(curseg_mutex),
+	 * under the owner core's sentry lock. The old block is invalidated
+	 * there too: under the same lock via
+	 * f3fs_try_invalidate_old_blkaddr_locked() if both segments have the same
+	 * owner core, otherwise synchronously (GC writes,
+	 * f3fs_invalidate_old_blkaddr_sync) or asynchronously (oldinv_enqueue).
 	 */
 	update_sit_entry(sbi, *new_blkaddr, 1);
 	update_sit_entry(sbi, old_blkaddr, -1);
@@ -3850,18 +4075,19 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct folio *folio,
 		if (type == CURSEG_COLD_DATA_PINNED &&
 		    !((curseg->segno + 1) % sbi->segs_per_sec)) {
 			write_sum_page(sbi, curseg->sum_blk, curseg->segno);
-			reset_curseg_fields(curseg);
+			/* DeLFS: drop the curseg ref as well */
+			release_curseg(sbi, curseg);
 			goto skip_new_segment;
 		}
 
 		if (from_gc) {
 			ret = get_atssr_segment(sbi, type, se->type,
-						AT_SSR, se->mtime);
+						AT_SSR, se->mtime, cpu);
 		} else {
-			if (need_new_seg(sbi, type))
-				ret = new_curseg(sbi, type, false);
+			if (need_new_seg(sbi, type, cpu))
+				ret = new_curseg(sbi, type, false, cpu);
 			else
-				ret = change_curseg(sbi, type);
+				ret = change_curseg(sbi, type, cpu);
 			stat_inc_seg_type(sbi, curseg);
 		}
 
@@ -3874,6 +4100,9 @@ skip_new_segment:
 	 * segment dirty status should be updated after segment allocation,
 	 * so we just need to update status only one time after previous
 	 * segment being closed.
+	 *
+	 * TODO(B): DeLFS(segment.c:4914) updates the dirty status under the
+	 * owner core's sentry lock, with the per-core dirty seglist.
 	 */
 	locate_dirty_segment(sbi, GET_SEGNO(sbi, old_blkaddr));
 	locate_dirty_segment(sbi, GET_SEGNO(sbi, *new_blkaddr));
@@ -3899,6 +4128,13 @@ skip_new_segment:
 
 		INIT_LIST_HEAD(&fio->list);
 		fio->in_list = 1;
+		/* DeLFS: remember the core whose cursegs served this IO */
+		fio->cpu = cpu;
+		/*
+		 * TODO(A): DeLFS queues the fio on the per-core write_io
+		 * (sbi->wrap_write_io of @cpu) and only for REQ_OP_WRITE fios;
+		 * write_io is owned by another part, so it is kept global here.
+		 */
 		io = sbi->write_io[fio->type] + fio->temp;
 		spin_lock(&io->io_lock);
 		list_add_tail(&fio->list, &io->io_list);
@@ -4117,16 +4353,27 @@ drop_bio:
 	return err;
 }
 
+/*
+ * DeLFS: find which core's curseg holds @segno. Returns the log type and
+ * sets *cpu, or NO_CHECK_TYPE. (DeLFS 6.6.8 only searched the calling core,
+ * which hits f2fs_bug_on() when another core owns the curseg.)
+ */
 static inline int __f2fs_get_curseg(struct f2fs_sb_info *sbi,
-						unsigned int segno)
+					unsigned int segno, int *cpu)
 {
-	int i;
+	int i, c;
 
-	for (i = CURSEG_HOT_DATA; i < NO_CHECK_TYPE; i++) {
-		if (CURSEG_I(sbi, i)->segno == segno)
-			break;
+	for_each_online_cpu(c) {
+		struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, c);
+
+		for (i = CURSEG_HOT_DATA; i < NO_CHECK_TYPE; i++) {
+			if ((cpu_array->array + i)->segno == segno) {
+				*cpu = c;
+				return i;
+			}
+		}
 	}
-	return i;
+	return NO_CHECK_TYPE;
 }
 
 void f2fs_do_replace_block(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
@@ -4139,6 +4386,8 @@ void f2fs_do_replace_block(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 	unsigned int segno, old_cursegno;
 	struct seg_entry *se;
 	int type;
+	/* DeLFS: default to the calling core; curseg_lock(write) excludes allocators */
+	int cpu = raw_smp_processor_id();
 	unsigned short old_blkoff;
 	unsigned char old_alloc_type;
 
@@ -4159,17 +4408,18 @@ void f2fs_do_replace_block(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 	} else {
 		if (is_curseg(sbi, segno)) {
 			/* se->type is volatile as SSR allocation */
-			type = __f2fs_get_curseg(sbi, segno);
+			type = __f2fs_get_curseg(sbi, segno, &cpu);
 			f2fs_bug_on(sbi, type == NO_CHECK_TYPE);
 		} else {
 			type = CURSEG_WARM_DATA;
 		}
 	}
 
-	curseg = CURSEG_I(sbi, type);
+	curseg = WRAP_CURSEG_I(sbi, cpu)->array + type;
 	f2fs_bug_on(sbi, !IS_DATASEG(curseg->seg_type));
 
 	mutex_lock(&curseg->curseg_mutex);
+	/* TODO(B): DeLFS(segment.c:5452) takes every per-core sentry lock here */
 	down_write(&sit_i->sentry_lock);
 
 	old_cursegno = curseg->segno;
@@ -4179,7 +4429,7 @@ void f2fs_do_replace_block(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 	/* change the current segment */
 	if (segno != curseg->segno) {
 		curseg->next_segno = segno;
-		if (change_curseg(sbi, type))
+		if (change_curseg(sbi, type, cpu))
 			goto out_unlock;
 	}
 
@@ -4206,7 +4456,7 @@ void f2fs_do_replace_block(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 	if (recover_curseg) {
 		if (old_cursegno != curseg->segno) {
 			curseg->next_segno = old_cursegno;
-			if (change_curseg(sbi, type))
+			if (change_curseg(sbi, type, cpu))
 				goto out_unlock;
 		}
 		curseg->next_blkoff = old_blkoff;
@@ -4286,16 +4536,27 @@ void f2fs_wait_on_block_writeback_range(struct inode *inode, block_t blkaddr,
 	f2fs_truncate_meta_inode_pages(sbi, blkaddr, len);
 }
 
-static int read_compacted_summaries(struct f2fs_sb_info *sbi)
+/*
+ * DeLFS: restore @cpu's compacted data summaries. Every core owns
+ * percore_sum_step() blocks starting at start_sum_block(), and its compacted
+ * data summaries occupy the first @blk_cnt (= max_npages) of them.
+ *
+ * TODO(B)/TODO(C): the SIT(COLD_DATA)/NAT(HOT_DATA) journals restored here
+ * are per-core; their consumers (SIT/NAT journal flush/lookup) are B/C.
+ */
+static int percore_read_compacted_summaries(struct f2fs_sb_info *sbi,
+			int blk_cnt, int cpu, struct curseg_info_array *cpu_array,
+			int max_npages)
 {
 	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
 	struct curseg_info *seg_i;
 	unsigned char *kaddr;
 	struct folio *folio;
-	block_t start;
+	block_t start, end;
 	int i, j, offset;
 
-	start = start_sum_block(sbi);
+	start = start_sum_block(sbi) + cpu * percore_sum_step(sbi, max_npages);
+	end = start + blk_cnt;
 
 	folio = f2fs_get_meta_folio(sbi, start++);
 	if (IS_ERR(folio))
@@ -4303,11 +4564,11 @@ static int read_compacted_summaries(struct f2fs_sb_info *sbi)
 	kaddr = folio_address(folio);
 
 	/* Step 1: restore nat cache */
-	seg_i = CURSEG_I(sbi, CURSEG_HOT_DATA);
+	seg_i = cpu_array->array + CURSEG_HOT_DATA;
 	memcpy(seg_i->journal, kaddr, sbi->sum_journal_size);
 
 	/* Step 2: restore sit cache */
-	seg_i = CURSEG_I(sbi, CURSEG_COLD_DATA);
+	seg_i = cpu_array->array + CURSEG_COLD_DATA;
 	memcpy(seg_i->journal, kaddr + sbi->sum_journal_size, sbi->sum_journal_size);
 	offset = 2 * sbi->sum_journal_size;
 
@@ -4316,11 +4577,11 @@ static int read_compacted_summaries(struct f2fs_sb_info *sbi)
 		unsigned short blk_off;
 		unsigned int segno;
 
-		seg_i = CURSEG_I(sbi, i);
-		segno = le32_to_cpu(ckpt->cur_data_segno[i]);
-		blk_off = le16_to_cpu(ckpt->cur_data_blkoff[i]);
+		seg_i = cpu_array->array + i;
+		segno = le32_to_cpu(ckpt->cur_datas_segno[cpu][i]);
+		blk_off = le16_to_cpu(ckpt->cur_datas_blkoff[cpu][i]);
 		seg_i->next_segno = segno;
-		reset_curseg(sbi, i, 0);
+		reset_curseg(sbi, i, 0, cpu, cpu_array);
 		seg_i->alloc_type = ckpt->alloc_type[i];
 		seg_i->next_blkoff = blk_off;
 
@@ -4339,6 +4600,12 @@ static int read_compacted_summaries(struct f2fs_sb_info *sbi)
 
 			f2fs_folio_put(folio, true);
 
+			/* never read into the next core's summary area */
+			if (start >= end) {
+				f2fs_err(sbi, "cpu %d: compacted summaries exceed %d blocks",
+					 cpu, blk_cnt);
+				return -EFSCORRUPTED;
+			}
 			folio = f2fs_get_meta_folio(sbi, start++);
 			if (IS_ERR(folio))
 				return PTR_ERR(folio);
@@ -4350,7 +4617,8 @@ static int read_compacted_summaries(struct f2fs_sb_info *sbi)
 	return 0;
 }
 
-static int read_normal_summaries(struct f2fs_sb_info *sbi, int type)
+static int percore_read_normal_summaries(struct f2fs_sb_info *sbi, int type,
+			int cpu, struct curseg_info_array *cpu_array, int max_npages)
 {
 	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
 	struct f2fs_summary_block *sum;
@@ -4359,25 +4627,29 @@ static int read_normal_summaries(struct f2fs_sb_info *sbi, int type)
 	unsigned short blk_off;
 	unsigned int segno = 0;
 	block_t blk_addr = 0;
+	long num_cpus = num_online_cpus();
 	int err = 0;
 
 	/* get segment number and block addr */
 	if (IS_DATASEG(type)) {
-		segno = le32_to_cpu(ckpt->cur_data_segno[type]);
-		blk_off = le16_to_cpu(ckpt->cur_data_blkoff[type -
+		segno = le32_to_cpu(ckpt->cur_datas_segno[cpu][type]);
+		blk_off = le16_to_cpu(ckpt->cur_datas_blkoff[cpu][type -
 							CURSEG_HOT_DATA]);
 		if (__exist_node_summaries(sbi))
-			blk_addr = sum_blk_addr(sbi, NR_CURSEG_PERSIST_TYPE, type);
+			blk_addr = sum_blk_addr(sbi, NR_CURSEG_PERSIST_TYPE, type,
+						num_cpus, cpu, max_npages);
 		else
-			blk_addr = sum_blk_addr(sbi, NR_CURSEG_DATA_TYPE, type);
+			blk_addr = sum_blk_addr(sbi, NR_CURSEG_DATA_TYPE, type,
+						num_cpus, cpu, max_npages);
 	} else {
-		segno = le32_to_cpu(ckpt->cur_node_segno[type -
+		segno = le32_to_cpu(ckpt->cur_nodes_segno[cpu][type -
 							CURSEG_HOT_NODE]);
-		blk_off = le16_to_cpu(ckpt->cur_node_blkoff[type -
+		blk_off = le16_to_cpu(ckpt->cur_nodes_blkoff[cpu][type -
 							CURSEG_HOT_NODE]);
 		if (__exist_node_summaries(sbi))
 			blk_addr = sum_blk_addr(sbi, NR_CURSEG_NODE_TYPE,
-							type - CURSEG_HOT_NODE);
+						type - CURSEG_HOT_NODE,
+						num_cpus, cpu, max_npages);
 		else
 			blk_addr = GET_SUM_BLOCK(sbi, segno);
 	}
@@ -4404,7 +4676,7 @@ static int read_normal_summaries(struct f2fs_sb_info *sbi, int type)
 	}
 
 	/* set uncompleted segment to curseg */
-	curseg = CURSEG_I(sbi, type);
+	curseg = cpu_array->array + type;
 	mutex_lock(&curseg->curseg_mutex);
 
 	/* update journal info */
@@ -4417,7 +4689,7 @@ static int read_normal_summaries(struct f2fs_sb_info *sbi, int type)
 	memcpy(sum_footer(sbi, curseg->sum_blk), sum_footer(sbi, sum),
 			SUM_FOOTER_SIZE);
 	curseg->next_segno = segno;
-	reset_curseg(sbi, type, 0);
+	reset_curseg(sbi, type, 0, cpu, cpu_array);
 	curseg->alloc_type = ckpt->alloc_type[type];
 	curseg->next_blkoff = blk_off;
 	mutex_unlock(&curseg->curseg_mutex);
@@ -4426,80 +4698,119 @@ out:
 	return err;
 }
 
+/*
+ * DeLFS: max_npages is the # of data summary blocks every core reserves in
+ * the cp pack: max over cores of compacted pages, or NR_CURSEG_DATA_TYPE.
+ */
+static int get_max_sum_npages(struct f2fs_sb_info *sbi)
+{
+	int cpu, npages, max_npages = 0;
+
+	if (!is_set_ckpt_flags(sbi, CP_COMPACT_SUM_FLAG))
+		return NR_CURSEG_DATA_TYPE;
+
+	for_each_online_cpu(cpu) {
+		npages = percore_f2fs_npages_for_summary_flush(sbi, true, cpu);
+		if (npages > max_npages)
+			max_npages = npages;
+	}
+	return max_npages;
+}
+
 static int restore_curseg_summaries(struct f2fs_sb_info *sbi)
 {
-	struct f2fs_journal *sit_j = CURSEG_I(sbi, CURSEG_COLD_DATA)->journal;
-	struct f2fs_journal *nat_j = CURSEG_I(sbi, CURSEG_HOT_DATA)->journal;
-	int type = CURSEG_HOT_DATA;
-	int err;
+	long num_cpus = num_online_cpus();
+	int max_npages = get_max_sum_npages(sbi);
+	int type, err, cpu;
 
-	if (is_set_ckpt_flags(sbi, CP_COMPACT_SUM_FLAG)) {
-		int npages = f2fs_npages_for_summary_flush(sbi, true);
+	for_each_online_cpu(cpu) {
+		struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+		struct f2fs_journal *sit_j, *nat_j;
 
-		if (npages >= 2)
-			f2fs_ra_meta_pages(sbi, start_sum_block(sbi), npages,
-							META_CP, true);
+		type = CURSEG_HOT_DATA;
 
-		/* restore for compacted data summary */
-		err = read_compacted_summaries(sbi);
-		if (err)
-			return err;
-		type = CURSEG_HOT_NODE;
-	}
+		if (is_set_ckpt_flags(sbi, CP_COMPACT_SUM_FLAG)) {
+			if (max_npages >= 2)
+				f2fs_ra_meta_pages(sbi, start_sum_block(sbi) +
+					cpu * percore_sum_step(sbi, max_npages),
+					max_npages, META_CP, true);
 
-	if (__exist_node_summaries(sbi))
-		f2fs_ra_meta_pages(sbi,
-				sum_blk_addr(sbi, NR_CURSEG_PERSIST_TYPE, type),
+			/* restore for compacted data summary */
+			err = percore_read_compacted_summaries(sbi, max_npages,
+						cpu, cpu_array, max_npages);
+			if (err)
+				return err;
+			type = CURSEG_HOT_NODE;
+		}
+
+		if (__exist_node_summaries(sbi))
+			f2fs_ra_meta_pages(sbi,
+				sum_blk_addr(sbi, NR_CURSEG_PERSIST_TYPE, type,
+						num_cpus, cpu, max_npages),
 				NR_CURSEG_PERSIST_TYPE - type, META_CP, true);
 
-	for (; type <= CURSEG_COLD_NODE; type++) {
-		err = read_normal_summaries(sbi, type);
-		if (err)
-			return err;
-	}
+		for (; type <= CURSEG_COLD_NODE; type++) {
+			err = percore_read_normal_summaries(sbi, type, cpu,
+							cpu_array, max_npages);
+			if (err)
+				return err;
+		}
 
-	/* sanity check for summary blocks */
-	if (nats_in_cursum(nat_j) > sbi->nat_journal_entries ||
-			sits_in_cursum(sit_j) > sbi->sit_journal_entries) {
-		f2fs_err(sbi, "invalid journal entries nats %u sits %u",
-			 nats_in_cursum(nat_j), sits_in_cursum(sit_j));
-		return -EINVAL;
+		/* sanity check for summary blocks */
+		sit_j = (cpu_array->array + CURSEG_COLD_DATA)->journal;
+		nat_j = (cpu_array->array + CURSEG_HOT_DATA)->journal;
+		if (nats_in_cursum(nat_j) > sbi->nat_journal_entries ||
+				sits_in_cursum(sit_j) > sbi->sit_journal_entries) {
+			f2fs_err(sbi, "cpu %d: invalid journal entries nats %u sits %u",
+				 cpu, nats_in_cursum(nat_j), sits_in_cursum(sit_j));
+			return -EINVAL;
+		}
 	}
 
 	return 0;
 }
 
-static void write_compacted_summaries(struct f2fs_sb_info *sbi, block_t blkaddr)
+/*
+ * DeLFS: write @cpu's compacted data summaries into exactly @blk_cnt
+ * (= max_npages) blocks. All blocks are grabbed and zeroed up front so that
+ * every core's summary area has a fixed size.
+ */
+static void write_compacted_summaries(struct f2fs_sb_info *sbi, block_t blkaddr,
+			int blk_cnt, int cpu, struct curseg_info_array *cpu_array)
 {
-	struct folio *folio;
+	struct folio *folio[NR_CURSEG_DATA_TYPE];
 	unsigned char *kaddr;
 	struct f2fs_summary *summary;
 	struct curseg_info *seg_i;
 	int written_size = 0;
-	int i, j;
+	int i, j, cur_idx = 0;
 
-	folio = f2fs_grab_meta_folio(sbi, blkaddr++);
-	kaddr = folio_address(folio);
-	memset(kaddr, 0, PAGE_SIZE);
+	f2fs_bug_on(sbi, blk_cnt < 1 || blk_cnt > NR_CURSEG_DATA_TYPE);
+
+	for (i = 0; i < blk_cnt; i++) {
+		folio[i] = f2fs_grab_meta_folio(sbi, blkaddr + i);
+		memset(folio_address(folio[i]), 0, PAGE_SIZE);
+	}
+	kaddr = folio_address(folio[cur_idx]);
 
 	/* Step 1: write nat cache */
-	seg_i = CURSEG_I(sbi, CURSEG_HOT_DATA);
+	seg_i = cpu_array->array + CURSEG_HOT_DATA;
 	memcpy(kaddr, seg_i->journal, sbi->sum_journal_size);
 	written_size += sbi->sum_journal_size;
 
 	/* Step 2: write sit cache */
-	seg_i = CURSEG_I(sbi, CURSEG_COLD_DATA);
+	seg_i = cpu_array->array + CURSEG_COLD_DATA;
 	memcpy(kaddr + written_size, seg_i->journal, sbi->sum_journal_size);
 	written_size += sbi->sum_journal_size;
 
 	/* Step 3: write summary entries */
 	for (i = CURSEG_HOT_DATA; i <= CURSEG_COLD_DATA; i++) {
-		seg_i = CURSEG_I(sbi, i);
-		for (j = 0; j < f2fs_curseg_valid_blocks(sbi, i); j++) {
-			if (!folio) {
-				folio = f2fs_grab_meta_folio(sbi, blkaddr++);
-				kaddr = folio_address(folio);
-				memset(kaddr, 0, PAGE_SIZE);
+		seg_i = cpu_array->array + i;
+		for (j = 0; j < f2fs_curseg_valid_blocks(sbi, i, cpu); j++) {
+			if (!kaddr) {
+				cur_idx++;
+				f2fs_bug_on(sbi, cur_idx >= blk_cnt);
+				kaddr = folio_address(folio[cur_idx]);
 				written_size = 0;
 			}
 			summary = (struct f2fs_summary *)(kaddr + written_size);
@@ -4510,19 +4821,18 @@ static void write_compacted_summaries(struct f2fs_sb_info *sbi, block_t blkaddr)
 							SUM_FOOTER_SIZE)
 				continue;
 
-			folio_mark_dirty(folio);
-			f2fs_folio_put(folio, true);
-			folio = NULL;
+			kaddr = NULL;
 		}
 	}
-	if (folio) {
-		folio_mark_dirty(folio);
-		f2fs_folio_put(folio, true);
+
+	for (i = 0; i < blk_cnt; i++) {
+		folio_mark_dirty(folio[i]);
+		f2fs_folio_put(folio[i], true);
 	}
 }
 
 static void write_normal_summaries(struct f2fs_sb_info *sbi,
-					block_t blkaddr, int type)
+		block_t blkaddr, int type, struct curseg_info_array *cpu_array)
 {
 	int i, end;
 
@@ -4532,20 +4842,22 @@ static void write_normal_summaries(struct f2fs_sb_info *sbi,
 		end = type + NR_CURSEG_NODE_TYPE;
 
 	for (i = type; i < end; i++)
-		write_current_sum_page(sbi, i, blkaddr + (i - type));
+		write_current_sum_page(sbi, i, blkaddr + (i - type), cpu_array);
 }
 
-void f2fs_write_data_summaries(struct f2fs_sb_info *sbi, block_t start_blk)
+void f2fs_write_data_summaries(struct f2fs_sb_info *sbi, block_t start_blk,
+		int blk_cnt, int cpu, struct curseg_info_array *cpu_array)
 {
 	if (is_set_ckpt_flags(sbi, CP_COMPACT_SUM_FLAG))
-		write_compacted_summaries(sbi, start_blk);
+		write_compacted_summaries(sbi, start_blk, blk_cnt, cpu, cpu_array);
 	else
-		write_normal_summaries(sbi, start_blk, CURSEG_HOT_DATA);
+		write_normal_summaries(sbi, start_blk, CURSEG_HOT_DATA, cpu_array);
 }
 
-void f2fs_write_node_summaries(struct f2fs_sb_info *sbi, block_t start_blk)
+void f2fs_write_node_summaries(struct f2fs_sb_info *sbi, block_t start_blk,
+		int cpu, struct curseg_info_array *cpu_array)
 {
-	write_normal_summaries(sbi, start_blk, CURSEG_HOT_NODE);
+	write_normal_summaries(sbi, start_blk, CURSEG_HOT_NODE, cpu_array);
 }
 
 int f2fs_lookup_journal_in_cursum(struct f2fs_sb_info *sbi,
@@ -4853,10 +5165,20 @@ static int build_sit_info(struct f2fs_sb_info *sbi)
 			sit_i->sentries[start].discard_map = bitmap;
 			bitmap += SIT_VBLOCK_MAP_SIZE;
 		}
+
+		/* DeLFS(A): curseg membership */
+		atomic_set(&sit_i->sentries[start].curseg_cpu, -1);
+		atomic_set(&sit_i->sentries[start].curseg_refs, 0);
 	}
 
 	sit_i->tmp_map = f2fs_kzalloc(sbi, SIT_VBLOCK_MAP_SIZE, GFP_KERNEL);
 	if (!sit_i->tmp_map)
+		return -ENOMEM;
+
+	/* DeLFS(A): cursec membership, zeroed */
+	sit_i->cursec_refs = f2fs_kvzalloc(sbi,
+			array_size(MAIN_SECS(sbi), sizeof(atomic_t)), GFP_KERNEL);
+	if (!sit_i->cursec_refs)
 		return -ENOMEM;
 
 	if (__is_large_section(sbi)) {
@@ -4932,31 +5254,53 @@ static int build_free_segmap(struct f2fs_sb_info *sbi)
 	return 0;
 }
 
+/*
+ * DeLFS: every online core owns NR_CURSEG_TYPE cursegs. The global
+ * SM_I(sbi)->curseg_array is no longer allocated (DeLFS doesn't either);
+ * on failure, partially allocated arrays are freed by destroy_curseg().
+ */
 static int build_curseg(struct f2fs_sb_info *sbi)
 {
-	struct curseg_info *array;
-	int i;
+	struct curseg_info_array __percpu *wrap_array;
+	int i, cpu;
 
-	array = f2fs_kzalloc(sbi, array_size(NR_CURSEG_TYPE,
-					sizeof(*array)), GFP_KERNEL);
-	if (!array)
+	if (num_online_cpus() > MAX_CORE_COUNT) {
+		f2fs_err(sbi, "too many online cpus: %u > %d",
+			 num_online_cpus(), MAX_CORE_COUNT);
+		return -EINVAL;
+	}
+
+	wrap_array = alloc_percpu(struct curseg_info_array);
+	if (!wrap_array)
 		return -ENOMEM;
 
-	SM_I(sbi)->curseg_array = array;
+	SM_I(sbi)->wrap_curseg_array = wrap_array;
 
-	for (i = 0; i < NO_CHECK_TYPE; i++) {
-		mutex_init(&array[i].curseg_mutex);
-		array[i].sum_blk = f2fs_kzalloc(sbi, sbi->sum_blocksize,
-				GFP_KERNEL);
-		if (!array[i].sum_blk)
+	for_each_online_cpu(cpu) {
+		struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+		struct curseg_info *array;
+
+		array = f2fs_kzalloc(sbi, array_size(NR_CURSEG_TYPE,
+					sizeof(*array)), GFP_KERNEL);
+		if (!array)
 			return -ENOMEM;
-		init_rwsem(&array[i].journal_rwsem);
-		array[i].journal = f2fs_kzalloc(sbi,
-				sbi->sum_journal_size, GFP_KERNEL);
-		if (!array[i].journal)
-			return -ENOMEM;
-		array[i].seg_type = log_type_to_seg_type(i);
-		reset_curseg_fields(&array[i]);
+		cpu_array->array = array;
+
+		for (i = 0; i < NO_CHECK_TYPE; i++) {
+			mutex_init(&array[i].curseg_mutex);
+			array[i].sum_blk = f2fs_kzalloc(sbi, sbi->sum_blocksize,
+					GFP_KERNEL);
+			if (!array[i].sum_blk)
+				return -ENOMEM;
+			init_rwsem(&array[i].journal_rwsem);
+			array[i].journal = f2fs_kzalloc(sbi,
+					sbi->sum_journal_size, GFP_KERNEL);
+			if (!array[i].journal)
+				return -ENOMEM;
+			array[i].seg_type = log_type_to_seg_type(i);
+			reset_curseg_fields(&array[i]);
+			array[i].next_blkoff = 0;
+		}
 	}
 	return restore_curseg_summaries(sbi);
 }
@@ -5019,8 +5363,8 @@ static int build_sit_entries(struct f2fs_sb_info *sbi)
 			}
 			memcpy(se->discard_map, se->cur_valid_map,
 						SIT_VBLOCK_MAP_SIZE);
-			sbi->discard_blks += BLKS_PER_SEG(sbi) -
-						se->valid_blocks;
+			atomic_add(BLKS_PER_SEG(sbi) -
+						se->valid_blocks, &sbi->discard_blks);
 init_discard_map_done:
 			if (__is_large_section(sbi))
 				get_sec_entry(sbi, start)->valid_blocks +=
@@ -5070,8 +5414,8 @@ init_discard_map_done:
 			} else {
 				memcpy(se->discard_map, se->cur_valid_map,
 							SIT_VBLOCK_MAP_SIZE);
-				sbi->discard_blks += old_valid_blocks;
-				sbi->discard_blks -= se->valid_blocks;
+				atomic_add(old_valid_blocks, &sbi->discard_blks);
+				atomic_sub(se->valid_blocks, &sbi->discard_blks);
 			}
 		}
 
@@ -5114,10 +5458,46 @@ init_discard_map_done:
 	return 0;
 }
 
+/*
+ * DeLFS: recompute curseg_refs/cursec_refs from the cursegs of every core,
+ * after build_sit_entries() has (re)loaded the SIT.
+ */
+static void rebuild_curseg_membership(struct f2fs_sb_info *sbi)
+{
+	struct sit_info *sit_i = SIT_I(sbi);
+	unsigned int segno, secno;
+	int cpu, type;
+
+	for (segno = 0; segno < MAIN_SEGS(sbi); segno++) {
+		atomic_set(&sit_i->sentries[segno].curseg_refs, 0);
+		atomic_set(&sit_i->sentries[segno].curseg_cpu, -1); /* debug only */
+	}
+
+	for (secno = 0; secno < MAIN_SECS(sbi); secno++)
+		atomic_set(&sit_i->cursec_refs[secno], 0);
+
+	for_each_online_cpu(cpu) {
+		struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+
+		for (type = CURSEG_HOT_DATA; type <= CURSEG_COLD_NODE; type++) {
+			struct curseg_info *curseg = cpu_array->array + type;
+			unsigned int csegno = READ_ONCE(curseg->segno);
+
+			if (!curseg->inited || csegno == NULL_SEGNO)
+				continue;
+
+			f2fs_bug_on(sbi, csegno >= MAIN_SEGS(sbi));
+
+			f2fs_curseg_get(sbi, csegno);
+			atomic_set(&get_seg_entry(sbi, csegno)->curseg_cpu, cpu);
+		}
+	}
+}
+
 static void init_free_segmap(struct f2fs_sb_info *sbi)
 {
 	unsigned int start;
-	int type;
+	int type, cpu;
 	struct seg_entry *sentry;
 
 	for (start = 0; start < MAIN_SEGS(sbi); start++) {
@@ -5131,11 +5511,19 @@ static void init_free_segmap(struct f2fs_sb_info *sbi)
 						sentry->valid_blocks;
 	}
 
-	/* set use the current segments */
-	for (type = CURSEG_HOT_DATA; type <= CURSEG_COLD_NODE; type++) {
-		struct curseg_info *curseg_t = CURSEG_I(sbi, type);
+	/* DeLFS: set use the current segments of every core */
+	for_each_online_cpu(cpu) {
+		struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
 
-		__set_test_and_inuse(sbi, curseg_t->segno);
+		for (type = CURSEG_HOT_DATA; type <= CURSEG_COLD_NODE; type++) {
+			struct curseg_info *curseg_t = cpu_array->array + type;
+
+			if (curseg_t->segno == NULL_SEGNO)
+				continue;
+
+			f2fs_bug_on(sbi, curseg_t->segno >= MAIN_SEGS(sbi));
+			__set_test_and_inuse(sbi, curseg_t->segno);
+		}
 	}
 }
 
@@ -5237,14 +5625,18 @@ static int build_dirty_segmap(struct f2fs_sb_info *sbi)
 
 static int sanity_check_curseg(struct f2fs_sb_info *sbi)
 {
-	int i;
+	int i, cpu;
 
 	/*
 	 * In LFS/SSR curseg, .next_blkoff should point to an unused blkaddr;
 	 * In LFS curseg, all blkaddr after .next_blkoff should be unused.
+	 * DeLFS: check the cursegs of every core.
 	 */
+	for_each_online_cpu(cpu) {
+	struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
+
 	for (i = 0; i < NR_PERSISTENT_LOG; i++) {
-		struct curseg_info *curseg = CURSEG_I(sbi, i);
+		struct curseg_info *curseg = cpu_array->array + i;
 		struct seg_entry *se = get_seg_entry(sbi, curseg->segno);
 		unsigned int blkofs = curseg->next_blkoff;
 
@@ -5273,12 +5665,13 @@ static int sanity_check_curseg(struct f2fs_sb_info *sbi)
 				continue;
 out:
 			f2fs_err(sbi,
-				 "Current segment's next free block offset is inconsistent with bitmap, logtype:%u, segno:%u, type:%u, next_blkoff:%u, blkofs:%u",
-				 i, curseg->segno, curseg->alloc_type,
+				 "Current segment's next free block offset is inconsistent with bitmap, cpu:%d, logtype:%u, segno:%u, type:%u, next_blkoff:%u, blkofs:%u",
+				 cpu, i, curseg->segno, curseg->alloc_type,
 				 curseg->next_blkoff, blkofs);
 			f2fs_handle_error(sbi, ERROR_INVALID_CURSEG);
 			return -EFSCORRUPTED;
 		}
+	}
 	}
 	return 0;
 }
@@ -5387,9 +5780,15 @@ static int report_one_zone_cb(struct blk_zone *zone, unsigned int idx,
 	return 0;
 }
 
-static int do_fix_curseg_write_pointer(struct f2fs_sb_info *sbi, int type)
+/*
+ * DeLFS: fix @cpu's curseg @type.
+ * TODO(A): zoned devices are untested with per-core cursegs; DeLFS 6.6.8
+ * only marked this path "need to check".
+ */
+static int do_fix_curseg_write_pointer(struct f2fs_sb_info *sbi, int type,
+								int cpu)
 {
-	struct curseg_info *cs = CURSEG_I(sbi, type);
+	struct curseg_info *cs = WRAP_CURSEG_I(sbi, cpu)->array + type;
 	struct f2fs_dev_info *zbd;
 	struct blk_zone zone;
 	unsigned int cs_section, wp_segno, wp_blkoff, wp_sector_off;
@@ -5443,7 +5842,11 @@ static int do_fix_curseg_write_pointer(struct f2fs_sb_info *sbi, int type)
 	    cs->segno != GET_SEG_FROM_SEC(sbi, GET_ZONE_FROM_SEC(sbi, cs_section))) {
 		unsigned int old_segno = cs->segno, old_blkoff = cs->next_blkoff;
 
-		f2fs_allocate_new_section(sbi, type, true);
+		f2fs_down_read(&SM_I(sbi)->curseg_lock);
+		down_write(&SIT_I(sbi)->sentry_lock);
+		__allocate_new_segment_cpu(sbi, type, true, true, cpu);
+		up_write(&SIT_I(sbi)->sentry_lock);
+		f2fs_up_read(&SM_I(sbi)->curseg_lock);
 		f2fs_notice(sbi, "Assign new section to curseg[%d]: "
 				"[0x%x,0x%x] -> [0x%x,0x%x]",
 				type, old_segno, old_blkoff,
@@ -5494,12 +5897,14 @@ static int do_fix_curseg_write_pointer(struct f2fs_sb_info *sbi, int type)
 
 static int fix_curseg_write_pointer(struct f2fs_sb_info *sbi)
 {
-	int i, ret;
+	int i, cpu, ret;
 
-	for (i = 0; i < NR_PERSISTENT_LOG; i++) {
-		ret = do_fix_curseg_write_pointer(sbi, i);
-		if (ret)
-			return ret;
+	for_each_online_cpu(cpu) {
+		for (i = 0; i < NR_PERSISTENT_LOG; i++) {
+			ret = do_fix_curseg_write_pointer(sbi, i, cpu);
+			if (ret)
+				return ret;
+		}
 	}
 
 	return 0;
@@ -5740,6 +6145,9 @@ int f2fs_build_segment_manager(struct f2fs_sb_info *sbi)
 	if (err)
 		return err;
 
+	/* DeLFS: rebuild curseg/cursec refs of every core's cursegs */
+	rebuild_curseg_membership(sbi);
+
 	init_free_segmap(sbi);
 	err = build_dirty_segmap(sbi);
 	if (err)
@@ -5795,19 +6203,36 @@ static void destroy_dirty_segmap(struct f2fs_sb_info *sbi)
 	kfree(dirty_i);
 }
 
+/*
+ * DeLFS: free every core's curseg array. (DeLFS 6.6.8 only freed the unused
+ * global curseg_array and leaked the per-core ones.) Iterate possible cpus
+ * so that a partially built array is freed too.
+ */
 static void destroy_curseg(struct f2fs_sb_info *sbi)
 {
-	struct curseg_info *array = SM_I(sbi)->curseg_array;
-	int i;
+	struct curseg_info_array __percpu *wrap_array =
+					SM_I(sbi)->wrap_curseg_array;
+	int i, cpu;
 
-	if (!array)
+	if (!wrap_array)
 		return;
-	SM_I(sbi)->curseg_array = NULL;
-	for (i = 0; i < NR_CURSEG_TYPE; i++) {
-		kfree(array[i].sum_blk);
-		kfree(array[i].journal);
+
+	for_each_possible_cpu(cpu) {
+		struct curseg_info_array *cpu_array = per_cpu_ptr(wrap_array, cpu);
+		struct curseg_info *array = cpu_array->array;
+
+		if (!array)
+			continue;
+		cpu_array->array = NULL;
+		for (i = 0; i < NR_CURSEG_TYPE; i++) {
+			kfree(array[i].sum_blk);
+			kfree(array[i].journal);
+		}
+		kfree(array);
 	}
-	kfree(array);
+
+	SM_I(sbi)->wrap_curseg_array = NULL;
+	free_percpu(wrap_array);
 }
 
 static void destroy_free_segmap(struct f2fs_sb_info *sbi)
@@ -5832,6 +6257,7 @@ static void destroy_sit_info(struct f2fs_sb_info *sbi)
 	if (sit_i->sentries)
 		kvfree(sit_i->bitmap);
 	kfree(sit_i->tmp_map);
+	kvfree(sit_i->cursec_refs);	/* DeLFS(A) */
 
 	kvfree(sit_i->sentries);
 	kvfree(sit_i->sec_entries);

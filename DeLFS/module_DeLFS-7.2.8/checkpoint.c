@@ -10,7 +10,7 @@
 #include <linux/mpage.h>
 #include <linux/writeback.h>
 #include <linux/blkdev.h>
-#include <linux/f2fs_fs.h>
+#include "delfs_fs.h"
 #include <linux/folio_batch.h>
 #include <linux/swap.h>
 #include <linux/kthread.h>
@@ -1038,6 +1038,7 @@ static void write_orphan_inodes(struct f2fs_sb_info *sbi, block_t start_blk)
 	}
 }
 
+/* DeLFS: the checksum covers the whole F2FS_CP_HDR_BLKS-block cp header */
 static __u32 f2fs_checkpoint_chksum(struct f2fs_checkpoint *ckpt)
 {
 	unsigned int chksum_ofs = le32_to_cpu(ckpt->checksum_offset);
@@ -1047,93 +1048,116 @@ static __u32 f2fs_checkpoint_chksum(struct f2fs_checkpoint *ckpt)
 	if (chksum_ofs < CP_CHKSUM_OFFSET) {
 		chksum_ofs += sizeof(chksum);
 		chksum = f2fs_chksum(chksum, (__u8 *)ckpt + chksum_ofs,
-				     F2FS_BLKSIZE - chksum_ofs);
+				     F2FS_CP_HDR_BLKS * F2FS_BLKSIZE - chksum_ofs);
 	}
 	return chksum;
 }
 
+/*
+ * DeLFS: read the F2FS_CP_HDR_BLKS-block cp header at @cp_addr into a newly
+ * allocated buffer and verify its checksum. On success, *cp_block holds the
+ * buffer (caller kvfree()s it); on failure nothing is left allocated.
+ */
 static int get_checkpoint_version(struct f2fs_sb_info *sbi, block_t cp_addr,
-		struct f2fs_checkpoint **cp_block, struct folio **cp_folio,
-		unsigned long long *version)
+		struct f2fs_checkpoint **cp_block, unsigned long long *version)
 {
+	unsigned long blk_size = sbi->blocksize;
+	struct f2fs_checkpoint *ckpt;
 	size_t crc_offset = 0;
 	__u32 crc;
+	int i;
 
-	*cp_folio = f2fs_get_meta_folio(sbi, cp_addr);
-	if (IS_ERR(*cp_folio))
-		return PTR_ERR(*cp_folio);
+	*cp_block = NULL;
 
-	*cp_block = folio_address(*cp_folio);
+	ckpt = f2fs_kvzalloc(sbi, array_size(blk_size, F2FS_CP_HDR_BLKS),
+			     GFP_KERNEL);
+	if (!ckpt)
+		return -ENOMEM;
 
-	crc_offset = le32_to_cpu((*cp_block)->checksum_offset);
+	for (i = 0; i < F2FS_CP_HDR_BLKS; i++) {
+		struct folio *folio = f2fs_get_meta_folio(sbi, cp_addr + i);
+
+		if (IS_ERR(folio)) {
+			kvfree(ckpt);
+			return PTR_ERR(folio);
+		}
+		memcpy((unsigned char *)ckpt + i * blk_size,
+		       folio_address(folio), blk_size);
+		f2fs_folio_put(folio, true);
+	}
+
+	crc_offset = le32_to_cpu(ckpt->checksum_offset);
 	if (crc_offset < CP_MIN_CHKSUM_OFFSET ||
 			crc_offset > CP_CHKSUM_OFFSET) {
-		f2fs_folio_put(*cp_folio, true);
+		kvfree(ckpt);
 		f2fs_warn(sbi, "invalid crc_offset: %zu", crc_offset);
 		return -EINVAL;
 	}
 
-	crc = f2fs_checkpoint_chksum(*cp_block);
-	if (crc != cur_cp_crc(*cp_block)) {
-		f2fs_folio_put(*cp_folio, true);
+	crc = f2fs_checkpoint_chksum(ckpt);
+	if (crc != cur_cp_crc(ckpt)) {
+		kvfree(ckpt);
 		f2fs_warn(sbi, "invalid crc value");
 		return -EINVAL;
 	}
 
-	*version = cur_cp_version(*cp_block);
+	*version = cur_cp_version(ckpt);
+	*cp_block = ckpt;
 	return 0;
 }
 
-static struct folio *validate_checkpoint(struct f2fs_sb_info *sbi,
+/*
+ * DeLFS: a cp pack spans F2FS_CP_PACK_SEGS segments and carries one cp header
+ * (F2FS_CP_HDR_BLKS blocks) at each end. Returns the leading header (caller
+ * kvfree()s it) if both copies are valid and have the same version.
+ */
+static struct f2fs_checkpoint *validate_checkpoint(struct f2fs_sb_info *sbi,
 				block_t cp_addr, unsigned long long *version)
 {
-	struct folio *cp_folio_1 = NULL, *cp_folio_2 = NULL;
-	struct f2fs_checkpoint *cp_block = NULL;
+	struct f2fs_checkpoint *cp_block_1 = NULL, *cp_block_2 = NULL;
 	unsigned long long cur_version = 0, pre_version = 0;
 	unsigned int cp_blocks;
 	int err;
 
-	err = get_checkpoint_version(sbi, cp_addr, &cp_block,
-					&cp_folio_1, version);
+	err = get_checkpoint_version(sbi, cp_addr, &cp_block_1, version);
 	if (err)
 		return NULL;
 
-	cp_blocks = le32_to_cpu(cp_block->cp_pack_total_block_count);
+	cp_blocks = le32_to_cpu(cp_block_1->cp_pack_total_block_count);
 
-	if (cp_blocks > BLKS_PER_SEG(sbi) || cp_blocks <= F2FS_CP_PACKS) {
+	if (cp_blocks > F2FS_CP_PACK_SEGS * BLKS_PER_SEG(sbi) ||
+			cp_blocks <= F2FS_CP_PACKS) {
 		f2fs_warn(sbi, "invalid cp_pack_total_block_count:%u",
-			  le32_to_cpu(cp_block->cp_pack_total_block_count));
+			  le32_to_cpu(cp_block_1->cp_pack_total_block_count));
 		goto invalid_cp;
 	}
 	pre_version = *version;
 
-	cp_addr += cp_blocks - 1;
-	err = get_checkpoint_version(sbi, cp_addr, &cp_block,
-					&cp_folio_2, version);
+	cp_addr += cp_blocks - F2FS_CP_HDR_BLKS;
+	err = get_checkpoint_version(sbi, cp_addr, &cp_block_2, version);
 	if (err)
 		goto invalid_cp;
 	cur_version = *version;
+	kvfree(cp_block_2);
 
 	if (cur_version == pre_version) {
 		*version = cur_version;
-		f2fs_folio_put(cp_folio_2, true);
-		return cp_folio_1;
+		return cp_block_1;
 	}
-	f2fs_folio_put(cp_folio_2, true);
 invalid_cp:
-	f2fs_folio_put(cp_folio_1, true);
+	kvfree(cp_block_1);
 	return NULL;
 }
 
 int f2fs_get_valid_checkpoint(struct f2fs_sb_info *sbi)
 {
-	struct f2fs_checkpoint *cp_block;
+	struct f2fs_checkpoint *cp1, *cp2, *cur_cp;
 	struct f2fs_super_block *fsb = sbi->raw_super;
-	struct folio *cp1, *cp2, *cur_folio;
+	struct folio *cur_folio;
 	unsigned long blk_size = sbi->blocksize;
 	unsigned long long cp1_version = 0, cp2_version = 0;
 	unsigned long long cp_start_blk_no;
-	unsigned int cp_blks = 1 + __cp_payload(sbi);
+	unsigned int cp_blks = F2FS_CP_HDR_BLKS + __cp_payload(sbi);
 	block_t cp_blk_no;
 	int i;
 	int err;
@@ -1149,29 +1173,29 @@ int f2fs_get_valid_checkpoint(struct f2fs_sb_info *sbi)
 	cp_start_blk_no = le32_to_cpu(fsb->cp_blkaddr);
 	cp1 = validate_checkpoint(sbi, cp_start_blk_no, &cp1_version);
 
-	/* The second checkpoint pack should start at the next segment */
-	cp_start_blk_no += ((unsigned long long)1) <<
+	/* DeLFS: the second cp pack starts F2FS_CP_PACK_SEGS segments later */
+	cp_start_blk_no += ((unsigned long long)F2FS_CP_PACK_SEGS) <<
 				le32_to_cpu(fsb->log_blocks_per_seg);
 	cp2 = validate_checkpoint(sbi, cp_start_blk_no, &cp2_version);
 
 	if (cp1 && cp2) {
 		if (ver_after(cp2_version, cp1_version))
-			cur_folio = cp2;
+			cur_cp = cp2;
 		else
-			cur_folio = cp1;
+			cur_cp = cp1;
 	} else if (cp1) {
-		cur_folio = cp1;
+		cur_cp = cp1;
 	} else if (cp2) {
-		cur_folio = cp2;
+		cur_cp = cp2;
 	} else {
 		err = -EFSCORRUPTED;
 		goto fail_no_cp;
 	}
 
-	cp_block = folio_address(cur_folio);
-	memcpy(sbi->ckpt, cp_block, blk_size);
+	/* copy the whole cp header of the chosen pack */
+	memcpy(sbi->ckpt, cur_cp, F2FS_CP_HDR_BLKS * blk_size);
 
-	if (cur_folio == cp1)
+	if (cur_cp == cp1)
 		sbi->cur_cp_pack = 1;
 	else
 		sbi->cur_cp_pack = 2;
@@ -1182,14 +1206,13 @@ int f2fs_get_valid_checkpoint(struct f2fs_sb_info *sbi)
 		goto free_fail_no_cp;
 	}
 
-	if (cp_blks <= 1)
+	if (cp_blks <= F2FS_CP_HDR_BLKS)
 		goto done;
 
-	cp_blk_no = le32_to_cpu(fsb->cp_blkaddr);
-	if (cur_folio == cp2)
-		cp_blk_no += BIT(le32_to_cpu(fsb->log_blocks_per_seg));
+	/* payload follows the leading cp header of the chosen pack only */
+	cp_blk_no = __start_cp_addr(sbi);
 
-	for (i = 1; i < cp_blks; i++) {
+	for (i = F2FS_CP_HDR_BLKS; i < cp_blks; i++) {
 		void *sit_bitmap_ptr;
 		unsigned char *ckpt = (unsigned char *)sbi->ckpt;
 
@@ -1203,15 +1226,16 @@ int f2fs_get_valid_checkpoint(struct f2fs_sb_info *sbi)
 		f2fs_folio_put(cur_folio, true);
 	}
 done:
-	f2fs_folio_put(cp1, true);
-	f2fs_folio_put(cp2, true);
+	kvfree(cp1);
+	kvfree(cp2);
 	return 0;
 
 free_fail_no_cp:
-	f2fs_folio_put(cp1, true);
-	f2fs_folio_put(cp2, true);
+	kvfree(cp1);
+	kvfree(cp2);
 fail_no_cp:
 	kvfree(sbi->ckpt);
+	sbi->ckpt = NULL;
 	return err;
 }
 
@@ -1383,7 +1407,7 @@ static void __prepare_cp_block(struct f2fs_sb_info *sbi)
 	ckpt->next_free_nid = cpu_to_le32(last_nid);
 
 	/* update user_block_counts */
-	sbi->last_valid_block_count = sbi->total_valid_block_count;
+	atomic_set(&sbi->last_valid_block_count, (block_t)atomic_read(&sbi->total_valid_block_count));
 	percpu_counter_set(&sbi->alloc_valid_block_count, 0);
 	percpu_counter_set(&sbi->rf_node_block_count, 0);
 }
@@ -1598,34 +1622,41 @@ static void update_ckpt_flags(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 	spin_unlock_irqrestore(&sbi->cp_lock, flags);
 }
 
+/*
+ * DeLFS: the commit copy of the cp header spans F2FS_CP_HDR_BLKS blocks at
+ * the tail of the cp pack.
+ */
 static void commit_checkpoint(struct f2fs_sb_info *sbi,
 	void *src, block_t blk_addr)
 {
 	struct writeback_control wbc = {};
+	int i;
 
-	/*
-	 * filemap_get_folios_tag and folio_lock again will take
-	 * some extra time. Therefore, f2fs_update_meta_pages and
-	 * f2fs_sync_meta_pages are combined in this function.
-	 */
-	struct folio *folio = f2fs_grab_meta_folio(sbi, blk_addr);
+	for (i = 0; i < F2FS_CP_HDR_BLKS; i++) {
+		/*
+		 * filemap_get_folios_tag and folio_lock again will take
+		 * some extra time. Therefore, f2fs_update_meta_pages and
+		 * f2fs_sync_meta_pages are combined in this function.
+		 */
+		struct folio *folio = f2fs_grab_meta_folio(sbi, blk_addr + i);
 
-	memcpy(folio_address(folio), src, PAGE_SIZE);
+		memcpy(folio_address(folio), src + F2FS_BLKSIZE * i, PAGE_SIZE);
 
-	folio_mark_dirty(folio);
-	if (unlikely(!folio_clear_dirty_for_io(folio)))
-		f2fs_bug_on(sbi, 1);
+		folio_mark_dirty(folio);
+		if (unlikely(!folio_clear_dirty_for_io(folio)))
+			f2fs_bug_on(sbi, 1);
 
-	/* writeout cp pack 2 page */
-	if (unlikely(!__f2fs_write_meta_folio(folio, &wbc, FS_CP_META_IO))) {
-		if (f2fs_cp_error(sbi)) {
-			f2fs_folio_put(folio, true);
-			return;
+		/* writeout cp pack 2 page */
+		if (unlikely(!__f2fs_write_meta_folio(folio, &wbc, FS_CP_META_IO))) {
+			if (f2fs_cp_error(sbi)) {
+				f2fs_folio_put(folio, true);
+				return;
+			}
+			f2fs_bug_on(sbi, true);
 		}
-		f2fs_bug_on(sbi, true);
-	}
 
-	f2fs_folio_put(folio, false);
+		f2fs_folio_put(folio, false);
+	}
 
 	/* submit checkpoint (with barrier if NOBARRIER is not set) */
 	f2fs_submit_merged_write(sbi, META_FLUSH);
@@ -1685,11 +1716,14 @@ static int do_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 	struct f2fs_nm_info *nm_i = NM_I(sbi);
 	unsigned long orphan_num = sbi->im[ORPHAN_INO].ino_num, flags;
 	block_t start_blk;
-	unsigned int data_sum_blocks, orphan_blocks;
+	unsigned int data_sum_blocks, max_data_sum_blocks = 0, orphan_blocks;
 	__u32 crc32 = 0;
 	int i;
 	int cp_payload_blks = __cp_payload(sbi);
-	struct curseg_info *seg_i = CURSEG_I(sbi, CURSEG_HOT_NODE);
+	/* DeLFS: every online core owns a set of cursegs and summaries */
+	int cpu, nr_cpus = num_online_cpus();
+	struct curseg_info_array *cpu_array;
+	struct curseg_info *seg_i;
 	u64 kbytes_written;
 	int err;
 
@@ -1701,41 +1735,66 @@ static int do_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 	/* start to update checkpoint, cp ver is already updated previously */
 	ckpt->elapsed_time = cpu_to_le64(get_mtime(sbi, true));
 	ckpt->free_segment_count = cpu_to_le32(free_segments(sbi));
-	for (i = 0; i < NR_CURSEG_NODE_TYPE; i++) {
-		struct curseg_info *curseg = CURSEG_I(sbi, i + CURSEG_HOT_NODE);
 
-		ckpt->cur_node_segno[i] = cpu_to_le32(curseg->segno);
-		ckpt->cur_node_blkoff[i] = cpu_to_le16(curseg->next_blkoff);
-		ckpt->alloc_type[i + CURSEG_HOT_NODE] = curseg->alloc_type;
+	for_each_online_cpu(cpu) {
+		cpu_array = WRAP_CURSEG_I(sbi, cpu);
+
+		for (i = 0; i < NR_CURSEG_NODE_TYPE; i++) {
+			struct curseg_info *curseg =
+				cpu_array->array + i + CURSEG_HOT_NODE;
+
+			ckpt->cur_nodes_segno[cpu][i] = cpu_to_le32(curseg->segno);
+			ckpt->cur_nodes_blkoff[cpu][i] =
+				cpu_to_le16(curseg->next_blkoff);
+			/*
+			 * TODO(A): alloc_type[] is not per-core, so only the
+			 * last core's value survives. DeLFS only uses LFS
+			 * (need_new_seg is always true), so this is harmless
+			 * for now; needs a per-core field if SSR is enabled.
+			 */
+			ckpt->alloc_type[i + CURSEG_HOT_NODE] = curseg->alloc_type;
+		}
+		for (i = 0; i < NR_CURSEG_DATA_TYPE; i++) {
+			struct curseg_info *curseg =
+				cpu_array->array + i + CURSEG_HOT_DATA;
+
+			ckpt->cur_datas_segno[cpu][i] = cpu_to_le32(curseg->segno);
+			ckpt->cur_datas_blkoff[cpu][i] =
+				cpu_to_le16(curseg->next_blkoff);
+			/* TODO(A): see above, alloc_type[] is shared by all cores */
+			ckpt->alloc_type[i + CURSEG_HOT_DATA] = curseg->alloc_type;
+		}
+
+		/* every core reserves the same (max) # of data summary blocks */
+		data_sum_blocks = percore_f2fs_npages_for_summary_flush(sbi,
+								false, cpu);
+		if (data_sum_blocks > max_data_sum_blocks)
+			max_data_sum_blocks = data_sum_blocks;
 	}
-	for (i = 0; i < NR_CURSEG_DATA_TYPE; i++) {
-		struct curseg_info *curseg = CURSEG_I(sbi, i + CURSEG_HOT_DATA);
 
-		ckpt->cur_data_segno[i] = cpu_to_le32(curseg->segno);
-		ckpt->cur_data_blkoff[i] = cpu_to_le16(curseg->next_blkoff);
-		ckpt->alloc_type[i + CURSEG_HOT_DATA] = curseg->alloc_type;
-	}
-
-	/* 2 cp + n data seg summary + orphan inode blocks */
-	data_sum_blocks = f2fs_npages_for_summary_flush(sbi, false);
 	spin_lock_irqsave(&sbi->cp_lock, flags);
-	if (data_sum_blocks < NR_CURSEG_DATA_TYPE)
+	if (max_data_sum_blocks < NR_CURSEG_DATA_TYPE)
 		__set_ckpt_flags(ckpt, CP_COMPACT_SUM_FLAG);
 	else
 		__clear_ckpt_flags(ckpt, CP_COMPACT_SUM_FLAG);
 	spin_unlock_irqrestore(&sbi->cp_lock, flags);
 
+	/*
+	 * DeLFS cp pack layout:
+	 * [cp header][payload][orphan][cpu0 data sums, node sums]...
+	 * [cpuN-1 data sums, node sums][cp header (commit)]
+	 */
 	orphan_blocks = GET_ORPHAN_BLOCKS(orphan_num);
-	ckpt->cp_pack_start_sum = cpu_to_le32(1 + cp_payload_blks +
-			orphan_blocks);
+	ckpt->cp_pack_start_sum = cpu_to_le32(F2FS_CP_HDR_BLKS +
+			cp_payload_blks + orphan_blocks);
 
 	if (__remain_node_summaries(cpc->reason))
 		ckpt->cp_pack_total_block_count = cpu_to_le32(F2FS_CP_PACKS +
-				cp_payload_blks + data_sum_blocks +
-				orphan_blocks + NR_CURSEG_NODE_TYPE);
+				cp_payload_blks + max_data_sum_blocks * nr_cpus +
+				orphan_blocks + NR_CURSEG_NODE_TYPE * nr_cpus);
 	else
 		ckpt->cp_pack_total_block_count = cpu_to_le32(F2FS_CP_PACKS +
-				cp_payload_blks + data_sum_blocks +
+				cp_payload_blks + max_data_sum_blocks * nr_cpus +
 				orphan_blocks);
 
 	/* update ckpt flag for checkpoint */
@@ -1760,16 +1819,25 @@ static int do_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 		cp_ver |= ((__u64)crc32 << 32);
 		*(__le64 *)nm_i->nat_bits = cpu_to_le64(cp_ver);
 
-		blk = start_blk + BLKS_PER_SEG(sbi) - nm_i->nat_bits_blocks;
+		/*
+		 * DeLFS: nat bits live at the tail of the F2FS_CP_PACK_SEGS-segment pack.
+		 * TODO(C): node.c reads them at __start_cp_addr + BLKS_PER_SEG
+		 * - nat_bits_blocks (vanilla); must use the same location.
+		 */
+		blk = start_blk + F2FS_CP_PACK_SEGS * BLKS_PER_SEG(sbi) -
+						nm_i->nat_bits_blocks;
 		for (i = 0; i < nm_i->nat_bits_blocks; i++)
 			f2fs_update_meta_page(sbi, nm_i->nat_bits +
 					F2FS_BLK_TO_BYTES(i), blk + i);
 	}
 
-	/* write out checkpoint buffer at block 0 */
-	f2fs_update_meta_page(sbi, ckpt, start_blk++);
+	/* write out the F2FS_CP_HDR_BLKS-block checkpoint header at block 0 */
+	for (i = 0; i < F2FS_CP_HDR_BLKS; i++)
+		f2fs_update_meta_page(sbi, (char *)ckpt + i * F2FS_BLKSIZE,
+							start_blk++);
 
-	for (i = 1; i < 1 + cp_payload_blks; i++)
+	/* payload follows the cp header in sbi->ckpt as well */
+	for (i = F2FS_CP_HDR_BLKS; i < F2FS_CP_HDR_BLKS + cp_payload_blks; i++)
 		f2fs_update_meta_page(sbi, (char *)ckpt + i * F2FS_BLKSIZE,
 							start_blk++);
 
@@ -1778,18 +1846,24 @@ static int do_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 		start_blk += orphan_blocks;
 	}
 
-	f2fs_write_data_summaries(sbi, start_blk);
-	start_blk += data_sum_blocks;
+	for_each_online_cpu(cpu) {
+		cpu_array = WRAP_CURSEG_I(sbi, cpu);
+		seg_i = cpu_array->array + CURSEG_HOT_NODE;
 
-	/* Record write statistics in the hot node summary */
-	kbytes_written = sbi->kbytes_written;
-	kbytes_written += (f2fs_get_sectors_written(sbi) -
-				sbi->sectors_written_start) >> 1;
-	seg_i->journal->info.kbytes_written = cpu_to_le64(kbytes_written);
+		f2fs_write_data_summaries(sbi, start_blk, max_data_sum_blocks,
+								cpu, cpu_array);
+		start_blk += max_data_sum_blocks;
 
-	if (__remain_node_summaries(cpc->reason)) {
-		f2fs_write_node_summaries(sbi, start_blk);
-		start_blk += NR_CURSEG_NODE_TYPE;
+		/* Record write statistics in the hot node summary */
+		kbytes_written = sbi->kbytes_written;
+		kbytes_written += (f2fs_get_sectors_written(sbi) -
+					sbi->sectors_written_start) >> 1;
+		seg_i->journal->info.kbytes_written = cpu_to_le64(kbytes_written);
+
+		if (__remain_node_summaries(cpc->reason)) {
+			f2fs_write_node_summaries(sbi, start_blk, cpu, cpu_array);
+			start_blk += NR_CURSEG_NODE_TYPE;
+		}
 	}
 
 	/* Here, we have one bio having CP pack except cp pack 2 page */
@@ -1876,7 +1950,7 @@ int f2fs_write_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 
 	if (!is_sbi_flag_set(sbi, SBI_IS_DIRTY) &&
 		((cpc->reason & CP_FASTBOOT) || (cpc->reason & CP_SYNC) ||
-		((cpc->reason & CP_DISCARD) && !sbi->discard_blks)))
+		((cpc->reason & CP_DISCARD) && !(block_t)atomic_read(&sbi->discard_blks))))
 		goto out;
 	if (unlikely(f2fs_cp_error(sbi))) {
 		err = -EIO;
@@ -1894,6 +1968,8 @@ int f2fs_write_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 	trace_f2fs_write_checkpoint(sbi->sb, cpc->reason, CP_PHASE_FINISH_BLOCK_OPS);
 
 	f2fs_flush_merged_writes(sbi);
+
+	/* TODO(B): oldinv_flush_all */
 
 	/* this is the case of multiple fstrims without any changes */
 	if (cpc->reason & CP_DISCARD) {
@@ -1979,9 +2055,11 @@ void f2fs_init_ino_entry_info(struct f2fs_sb_info *sbi)
 		im->ino_num = 0;
 	}
 
-	sbi->max_orphans = (BLKS_PER_SEG(sbi) - F2FS_CP_PACKS -
-			NR_CURSEG_PERSIST_TYPE - __cp_payload(sbi)) *
-			F2FS_ORPHANS_PER_BLOCK;
+	/* DeLFS: every online core reserves NR_CURSEG_PERSIST_TYPE summary blocks */
+	sbi->max_orphans = (F2FS_CP_PACK_SEGS * BLKS_PER_SEG(sbi) -
+			F2FS_CP_PACKS -
+			NR_CURSEG_PERSIST_TYPE * num_online_cpus() -
+			__cp_payload(sbi)) * F2FS_ORPHANS_PER_BLOCK;
 }
 
 int __init f2fs_create_checkpoint_caches(void)

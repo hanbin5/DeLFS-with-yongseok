@@ -8,7 +8,7 @@
  */
 #include <linux/compiler.h>
 #include <linux/proc_fs.h>
-#include <linux/f2fs_fs.h>
+#include "delfs_fs.h"
 #include <linux/seq_file.h>
 #include <linux/unicode.h>
 #include <linux/ioprio.h>
@@ -250,7 +250,8 @@ static ssize_t features_show(struct f2fs_attr *a,
 static ssize_t current_reserved_blocks_show(struct f2fs_attr *a,
 					struct f2fs_sb_info *sbi, char *buf)
 {
-	return sysfs_emit(buf, "%u\n", sbi->current_reserved_blocks);
+	return sysfs_emit(buf, "%u\n",
+			(block_t)atomic_read(&sbi->current_reserved_blocks));
 }
 
 static ssize_t unusable_show(struct f2fs_attr *a,
@@ -383,6 +384,11 @@ static ssize_t f2fs_sbi_show(struct f2fs_attr *a,
 	ptr = __struct_ptr(sbi, a->struct_type);
 	if (!ptr)
 		return -EINVAL;
+
+	/* DeLFS: reserved_blocks is atomic_t, don't read it through ptr + offset */
+	if (a->struct_type == RESERVED_BLOCKS)
+		return sysfs_emit(buf, "%u\n",
+				(block_t)atomic_read(&sbi->reserved_blocks));
 
 	if (!strcmp(a->attr.name, "extension_list")) {
 		__u8 (*extlist)[F2FS_EXTENSION_LEN] =
@@ -592,14 +598,16 @@ out:
 #endif
 	if (a->struct_type == RESERVED_BLOCKS) {
 		spin_lock(&sbi->stat_lock);
-		if (t > (unsigned long)(sbi->user_block_count -
+		if (t > (unsigned long)((block_t)atomic_read(&sbi->user_block_count) -
 				F2FS_OPTION(sbi).root_reserved_blocks)) {
 			spin_unlock(&sbi->stat_lock);
 			return -EINVAL;
 		}
-		*ui = t;
-		sbi->current_reserved_blocks = min(sbi->reserved_blocks,
-				sbi->user_block_count - valid_user_blocks(sbi));
+		atomic_set(&sbi->reserved_blocks, t);
+		atomic_set(&sbi->current_reserved_blocks,
+			min((block_t)atomic_read(&sbi->reserved_blocks),
+				(block_t)atomic_read(&sbi->user_block_count) -
+						valid_user_blocks(sbi)));
 		spin_unlock(&sbi->stat_lock);
 		return count;
 	}
