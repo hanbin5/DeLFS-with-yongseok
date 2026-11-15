@@ -5644,8 +5644,17 @@ static void kill_f2fs_super(struct super_block *sb)
 			struct cp_control cpc = {
 				.reason = CP_UMOUNT,
 			};
+			struct f2fs_lock_context lc;
+
 			stat_inc_cp_call_count(sbi, TOTAL_CALL);
+			/*
+			 * DeLFS: GC runs on every core under gc_lock held for
+			 * read, so the umount checkpoint takes it for write to
+			 * exclude all of them (as 6.6.8 DeLFS does).
+			 */
+			f2fs_down_write_trace(&sbi->gc_lock, &lc);
 			f2fs_write_checkpoint(sbi, &cpc);
+			f2fs_up_write_trace(&sbi->gc_lock, &lc);
 		}
 
 		if (is_sbi_flag_set(sbi, SBI_IS_RECOVERED) && f2fs_readonly(sb))
