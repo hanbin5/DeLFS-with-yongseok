@@ -19,6 +19,15 @@
 #include "node.h"
 #include <trace/events/f2fs.h>
 
+static inline int ino_to_extent_cpu(struct extent_tree_info *eti, nid_t ino)
+{
+	int n = READ_ONCE(eti->nr_extent_buckets);
+
+	if (unlikely(n <= 0))
+		return 0;
+	return ino % n;
+}
+
 bool sanity_check_extent_cache(struct inode *inode, struct folio *ifolio)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
@@ -335,10 +344,16 @@ static void __release_extent_node(struct f2fs_sb_info *sbi,
 {
 	struct extent_tree_info *eti = &sbi->extent_tree[et->type];
 
-	spin_lock(&eti->extent_lock);
+	int extent_cpu = ino_to_extent_cpu(eti, et->ino);
+
+	spinlock_t *p_extent_lock = per_cpu_ptr(eti->p_extent_lock, extent_cpu);
+
+	//spin_lock(&eti->extent_lock);
+	spin_lock(p_extent_lock);
 	f2fs_bug_on(sbi, list_empty(&en->list));
 	list_del_init(&en->list);
-	spin_unlock(&eti->extent_lock);
+	//spin_unlock(&eti->extent_lock);
+	spin_unlock(p_extent_lock);
 
 	__detach_extent_node(sbi, et, en);
 }
@@ -446,9 +461,17 @@ void f2fs_init_read_extent_tree(struct inode *inode, struct folio *ifolio)
 		et->largest = en->ei;
 		et->cached_en = en;
 
-		spin_lock(&eti->extent_lock);
-		list_add_tail(&en->list, &eti->extent_list);
-		spin_unlock(&eti->extent_lock);
+		int extent_cpu = ino_to_extent_cpu(eti, et->ino);
+		struct list_head *p_extent_list = per_cpu_ptr(eti->p_extent_list, extent_cpu);
+		spinlock_t *p_extent_lock = per_cpu_ptr(eti->p_extent_lock, extent_cpu);
+
+		spin_lock(p_extent_lock);
+		list_add_tail(&en->list, p_extent_list);
+		spin_unlock(p_extent_lock);
+
+//		spin_lock(&eti->extent_lock);
+//		list_add_tail(&en->list, &eti->extent_list);
+//		spin_unlock(&eti->extent_lock);
 	}
 skip:
 	/* Let's drop, if checkpoint got corrupted. */
@@ -517,12 +540,24 @@ static bool __lookup_extent_tree(struct inode *inode, pgoff_t pgofs,
 		stat_inc_rbtree_node_hit(sbi, type);
 
 	*ei = en->ei;
-	spin_lock(&eti->extent_lock);
+
+	int extent_cpu = ino_to_extent_cpu(eti, et->ino);
+	struct list_head *p_extent_list = per_cpu_ptr(eti->p_extent_list, extent_cpu);
+	spinlock_t *p_extent_lock = per_cpu_ptr(eti->p_extent_lock, extent_cpu);
+
+	spin_lock(p_extent_lock);
 	if (!list_empty(&en->list)) {
-		list_move_tail(&en->list, &eti->extent_list);
+		list_move_tail(&en->list, p_extent_list);
 		et->cached_en = en;
 	}
-	spin_unlock(&eti->extent_lock);
+	spin_unlock(p_extent_lock);
+
+//	spin_lock(&eti->extent_lock);
+//	if (!list_empty(&en->list)) {
+//		list_move_tail(&en->list, &eti->extent_list);
+//		et->cached_en = en;
+//	}
+//	spin_unlock(&eti->extent_lock);
 	ret = true;
 out:
 	stat_inc_total_hit(sbi, type);
@@ -565,12 +600,23 @@ static struct extent_node *__try_merge_extent_node(struct f2fs_sb_info *sbi,
 
 	__try_update_largest_extent(et, en);
 
-	spin_lock(&eti->extent_lock);
+	int extent_cpu = ino_to_extent_cpu(eti, et->ino);
+	struct list_head *p_extent_list = per_cpu_ptr(eti->p_extent_list, extent_cpu);
+	spinlock_t *p_extent_lock = per_cpu_ptr(eti->p_extent_lock, extent_cpu);
+
+	spin_lock(p_extent_lock);
 	if (!list_empty(&en->list)) {
-		list_move_tail(&en->list, &eti->extent_list);
+		list_move_tail(&en->list, p_extent_list);
 		et->cached_en = en;
 	}
-	spin_unlock(&eti->extent_lock);
+	spin_unlock(p_extent_lock);
+
+//	spin_lock(&eti->extent_lock);
+//	if (!list_empty(&en->list)) {
+//		list_move_tail(&en->list, &eti->extent_list);
+//		et->cached_en = en;
+//	}
+//	spin_unlock(&eti->extent_lock);
 	return en;
 }
 
@@ -621,11 +667,20 @@ do_insert:
 
 	__try_update_largest_extent(et, en);
 
+	int extent_cpu = ino_to_extent_cpu(eti, et->ino);
+	struct list_head *p_extent_list = per_cpu_ptr(eti->p_extent_list, extent_cpu);
+	spinlock_t *p_extent_lock = per_cpu_ptr(eti->p_extent_lock, extent_cpu);
+
 	/* update in global extent list */
-	spin_lock(&eti->extent_lock);
-	list_add_tail(&en->list, &eti->extent_list);
+	spin_lock(p_extent_lock);
+	list_add_tail(&en->list, p_extent_list);
 	et->cached_en = en;
-	spin_unlock(&eti->extent_lock);
+	spin_unlock(p_extent_lock);
+
+//	spin_lock(&eti->extent_lock);
+//	list_add_tail(&en->list, &eti->extent_list);
+//	et->cached_en = en;
+//	spin_unlock(&eti->extent_lock);
 	return en;
 }
 
@@ -971,6 +1026,10 @@ static unsigned int __shrink_extent_tree(struct f2fs_sb_info *sbi, int nr_shrink
 	struct extent_node *en;
 	unsigned int node_cnt = 0, tree_cnt = 0;
 	int remained;
+	int i, max_cpu, start_cpu, extent_cpu, next_cpu;
+
+	if (nr_shrink <= 0)
+		return 0;
 
 	if (!atomic_read(&eti->total_zombie_tree))
 		goto free_node;
@@ -1009,30 +1068,94 @@ free_node:
 		goto out;
 
 	remained = nr_shrink - (node_cnt + tree_cnt);
+	if (remained <= 0)
+		goto unlock_out;
 
-	spin_lock(&eti->extent_lock);
-	for (; remained > 0; remained--) {
-		if (list_empty(&eti->extent_list))
-			break;
-		en = list_first_entry(&eti->extent_list,
-					struct extent_node, list);
-		et = en->et;
-		if (!write_trylock(&et->lock)) {
-			/* refresh this extent node's position in extent list */
-			list_move_tail(&en->list, &eti->extent_list);
-			continue;
+	max_cpu = num_online_cpus();
+	if (unlikely(max_cpu <= 0))
+		goto unlock_out;
+
+	start_cpu = atomic_read(&eti->rr_cpu);
+	if (start_cpu < 0 || start_cpu >= max_cpu)
+		start_cpu = 0;
+
+	extent_cpu = start_cpu;
+	next_cpu = start_cpu;
+
+	while (remained > 0) {
+		bool progressed = false;
+
+		for (i = 0; i < max_cpu; i++) {
+			struct list_head *p_extent_list;
+			spinlock_t *p_extent_lock;
+
+			extent_cpu = (start_cpu + i) % max_cpu;
+			if (WARN_ON_ONCE(extent_cpu < 0 || extent_cpu >= max_cpu))
+				continue;
+
+			p_extent_list = per_cpu_ptr(eti->p_extent_list, extent_cpu);
+			p_extent_lock = per_cpu_ptr(eti->p_extent_lock, extent_cpu);
+
+			if (!spin_trylock(p_extent_lock))
+				continue;
+
+			if (list_empty(p_extent_list)) {
+				spin_unlock(p_extent_lock);
+				continue;
+			}
+
+			en = list_first_entry(p_extent_list, struct extent_node, list);
+			et = en->et;
+
+			if (!write_trylock(&et->lock)) {
+				list_move_tail(&en->list, p_extent_list);
+				spin_unlock(p_extent_lock);
+				continue;
+			}
+
+			list_del_init(&en->list);
+			spin_unlock(p_extent_lock);
+
+			__detach_extent_node(sbi, et, en);
+
+			write_unlock(&et->lock);
+			node_cnt++;
+			remained--;
+			progressed = true;
+			next_cpu = (extent_cpu + 1) % max_cpu;
 		}
 
-		list_del_init(&en->list);
-		spin_unlock(&eti->extent_lock);
-
-		__detach_extent_node(sbi, et, en);
-
-		write_unlock(&et->lock);
-		node_cnt++;
-		spin_lock(&eti->extent_lock);
+		if (!progressed)
+			break;
+		if (remained)
+			cond_resched();
 	}
-	spin_unlock(&eti->extent_lock);
+
+	atomic_set(&eti->rr_cpu, next_cpu);
+
+//	spin_lock(&eti->extent_lock);
+//	for (; remained > 0; remained--) {
+//		if (list_empty(&eti->extent_list))
+//			break;
+//		en = list_first_entry(&eti->extent_list,
+//					struct extent_node, list);
+//		et = en->et;
+//		if (!write_trylock(&et->lock)) {
+//			/* refresh this extent node's position in extent list */
+//			list_move_tail(&en->list, &eti->extent_list);
+//			continue;
+//		}
+//
+//		list_del_init(&en->list);
+//		spin_unlock(&eti->extent_lock);
+//
+//		__detach_extent_node(sbi, et, en);
+//
+//		write_unlock(&et->lock);
+//		node_cnt++;
+//		spin_lock(&eti->extent_lock);
+//	}
+//	spin_unlock(&eti->extent_lock);
 
 unlock_out:
 	mutex_unlock(&eti->extent_tree_lock);
@@ -1210,8 +1333,25 @@ static void __init_extent_tree_info(struct extent_tree_info *eti)
 {
 	INIT_RADIX_TREE(&eti->extent_tree_root, GFP_NOIO);
 	mutex_init(&eti->extent_tree_lock);
-	INIT_LIST_HEAD(&eti->extent_list);
-	spin_lock_init(&eti->extent_lock);
+//	INIT_LIST_HEAD(&eti->extent_list);
+//	spin_lock_init(&eti->extent_lock);
+
+	eti->p_extent_list = alloc_percpu(struct list_head);
+	eti->p_extent_lock = alloc_percpu(spinlock_t);
+
+	int max_cpu = num_online_cpus();
+	int extent_cpu;
+	for_each_online_cpu(extent_cpu) {
+		struct list_head *p_extent_list = per_cpu_ptr(eti->p_extent_list, extent_cpu);
+		spinlock_t *p_extent_lock = per_cpu_ptr(eti->p_extent_lock, extent_cpu);
+
+		INIT_LIST_HEAD(p_extent_list);
+		spin_lock_init(p_extent_lock);
+	}
+
+	atomic_set(&eti->rr_cpu, 0);
+	eti->nr_extent_buckets = num_online_cpus();
+
 	atomic_set(&eti->total_ext_tree, 0);
 	INIT_LIST_HEAD(&eti->zombie_list);
 	atomic_set(&eti->total_zombie_tree, 0);

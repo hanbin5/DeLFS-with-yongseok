@@ -18,12 +18,14 @@ static unsigned int shrinker_run_no;
 
 static unsigned long __count_nat_entries(struct f2fs_sb_info *sbi)
 {
-	return NM_I(sbi)->nat_cnt[RECLAIMABLE_NAT];
+	//return NM_I(sbi)->nat_cnt[RECLAIMABLE_NAT];
+	return atomic_read(&NM_I(sbi)->nat_cnt[RECLAIMABLE_NAT]);
 }
 
 static unsigned long __count_free_nids(struct f2fs_sb_info *sbi)
 {
-	long count = NM_I(sbi)->nid_cnt[FREE_NID] - MAX_FREE_NIDS;
+	//long count = NM_I(sbi)->nid_cnt[FREE_NID] - MAX_FREE_NIDS;
+	long count = atomic_read(&NM_I(sbi)->nid_cnt[FREE_NID]) - MAX_FREE_NIDS;
 
 	return count > 0 ? count : 0;
 }
@@ -84,6 +86,7 @@ unsigned long f2fs_shrink_scan(struct shrinker *shrink,
 	struct list_head *p;
 	unsigned int run_no;
 	unsigned long freed = 0;
+	int nat_cpu;
 
 	spin_lock(&f2fs_list_lock);
 	do {
@@ -112,8 +115,10 @@ unsigned long f2fs_shrink_scan(struct shrinker *shrink,
 		freed += f2fs_shrink_read_extent_tree(sbi, nr >> 2);
 
 		/* shrink clean nat cache entries */
-		if (freed < nr)
-			freed += f2fs_try_to_free_nats(sbi, nr - freed);
+		if (freed < nr) {
+			for_each_online_cpu(nat_cpu)
+				freed += f2fs_try_to_free_nats(sbi, nr - freed, nat_cpu);
+		}
 
 		/* shrink free nids cache entries */
 		if (freed < nr)

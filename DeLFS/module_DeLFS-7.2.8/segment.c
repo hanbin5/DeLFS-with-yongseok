@@ -624,6 +624,8 @@ static inline bool excess_dirty_threshold(struct f2fs_sb_info *sbi)
 
 void f2fs_balance_fs_bg(struct f2fs_sb_info *sbi, bool from_bg)
 {
+	int nat_cpu;
+
 	if (unlikely(is_sbi_flag_set(sbi, SBI_POR_DOING)))
 		return;
 
@@ -638,8 +640,10 @@ void f2fs_balance_fs_bg(struct f2fs_sb_info *sbi, bool from_bg)
 				AGE_EXTENT_CACHE_SHRINK_NUMBER);
 
 	/* check the # of cached NAT entries */
-	if (!f2fs_available_free_memory(sbi, NAT_ENTRIES))
-		f2fs_try_to_free_nats(sbi, NAT_ENTRY_PER_BLOCK);
+	if (!f2fs_available_free_memory(sbi, NAT_ENTRIES)) {
+		for_each_online_cpu(nat_cpu)
+			f2fs_try_to_free_nats(sbi, NAT_ENTRY_PER_BLOCK, nat_cpu);
+	}
 
 	if (!f2fs_available_free_memory(sbi, FREE_NIDS))
 		f2fs_try_to_free_nids(sbi, MAX_FREE_NIDS);
