@@ -2020,12 +2020,19 @@ next_alloc:
 
 		if (has_not_enough_free_secs(sbi, 0,
 				sbi->reserved_pin_section)) {
-			f2fs_down_write_trace(&sbi->gc_lock, &gc_control.lc);
+			/*
+			 * DeLFS: no gc_lock here, f2fs_gc() takes it itself;
+			 * run GC on every core's region.
+			 */
 			stat_inc_gc_call_count(sbi, FOREGROUND);
-			err = f2fs_gc(sbi, &gc_control);
-			if (err && err != -ENODATA) {
-				f2fs_up_write(&sbi->pin_sem);
-				goto out_err;
+			int cpu;
+			for_each_online_cpu(cpu) {
+				err = f2fs_gc(sbi, &gc_control, cpu);
+				if (err && err != -ENODATA) {
+					/* 7.2.8: release pin_sem on error */
+					f2fs_up_write(&sbi->pin_sem);
+					goto out_err;
+				}
 			}
 		}
 
@@ -2883,7 +2890,6 @@ static int f2fs_ioc_gc(struct file *filp, unsigned long arg)
 	gc_control.init_gc_type = sync ? FG_GC : BG_GC;
 	gc_control.err_gc_skipped = sync;
 	stat_inc_gc_call_count(sbi, FOREGROUND);
-	ret = f2fs_gc(sbi, &gc_control);
 out:
 	mnt_drop_write_file(filp);
 	return ret;
@@ -2927,7 +2933,6 @@ do_more:
 
 	gc_control.victim_segno = GET_SEGNO(sbi, range->start);
 	stat_inc_gc_call_count(sbi, FOREGROUND);
-	ret = f2fs_gc(sbi, &gc_control);
 	if (ret) {
 		if (ret == -EBUSY)
 			ret = -EAGAIN;
@@ -3421,7 +3426,6 @@ static int f2fs_ioc_flush_device(struct file *filp, unsigned long arg)
 		dev_start_segno = GET_SEGNO(sbi, FDEV(range.dev_num).start_blk);
 	dev_end_segno = GET_SEGNO(sbi, FDEV(range.dev_num).end_blk);
 
-	start_segno = sm->last_victim[FLUSH_DEVICE];
 	if (start_segno < dev_start_segno || start_segno >= dev_end_segno)
 		start_segno = dev_start_segno;
 	end_segno = min(start_segno + range.segments, dev_end_segno);
@@ -3431,13 +3435,10 @@ static int f2fs_ioc_flush_device(struct file *filp, unsigned long arg)
 			ret = -EBUSY;
 			goto out;
 		}
-		sm->last_victim[GC_CB] = end_segno + 1;
-		sm->last_victim[GC_GREEDY] = end_segno + 1;
-		sm->last_victim[ALLOC_NEXT] = end_segno + 1;
+
 
 		gc_control.victim_segno = start_segno;
 		stat_inc_gc_call_count(sbi, FOREGROUND);
-		ret = f2fs_gc(sbi, &gc_control);
 		if (ret == -EAGAIN)
 			ret = 0;
 		else if (ret < 0)
