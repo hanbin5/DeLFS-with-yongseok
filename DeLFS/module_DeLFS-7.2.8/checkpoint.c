@@ -950,9 +950,12 @@ int f2fs_recover_orphan_inodes(struct f2fs_sb_info *sbi)
 
 	if (is_sbi_flag_set(sbi, SBI_IS_WRITABLE))
 		f2fs_info(sbi, "orphan cleanup on readonly fs");
+	
+//	start_blk = __start_cp_addr(sbi) + 1 + __cp_payload(sbi);
+//	orphan_blocks = __start_sum_addr(sbi) - 1 - __cp_payload(sbi);
 
-	start_blk = __start_cp_addr(sbi) + 1 + __cp_payload(sbi);
-	orphan_blocks = __start_sum_addr(sbi) - 1 - __cp_payload(sbi);
+	start_blk = __start_cp_addr(sbi) + 4 + __cp_payload(sbi);
+	orphan_blocks = __start_sum_addr(sbi) - 4 - __cp_payload(sbi);
 
 	f2fs_ra_meta_pages(sbi, start_blk, orphan_blocks, META_CP, true);
 
@@ -1293,12 +1296,15 @@ void f2fs_update_dirty_folio(struct inode *inode, struct folio *folio)
 		return;
 
 	ktget(&stopwatch[0]);
-	spin_lock(&sbi->inode_lock[type]);
-	if (type != FILE_INODE || test_opt(sbi, DATA_FLUSH))
+//	spin_lock(&sbi->inode_lock[type]);
+	if (type != FILE_INODE || test_opt(sbi, DATA_FLUSH)) {
+		spin_lock(&sbi->inode_lock[type]);
 		__add_dirty_inode(inode, type);
+		spin_unlock(&sbi->inode_lock[type]);
+	}
 	inode_inc_dirty_pages(inode);
-	spin_unlock(&sbi->inode_lock[type]);
-
+//	spin_unlock(&sbi->inode_lock[type]);
+	
 	ktget(&stopwatch[1]);
 	ktput(stopwatch, spin_lock__inode_lock);
 
