@@ -41,6 +41,7 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/f2fs.h>
+#include "calc/calclock.h"
 
 static struct kmem_cache *f2fs_inode_cachep;
 
@@ -2109,8 +2110,11 @@ static void f2fs_put_super(struct super_block *sb)
 	oldinv_exit(sbi);
 }
 
-int f2fs_sync_fs(struct super_block *sb, int sync)
+KTDEF(f3fs_issue_checkpoint);
+
+static int f2fs_sync_fs_internal(struct super_block *sb, int sync)
 {
+	ktime_t stopwatch[2];
 	struct f2fs_sb_info *sbi = F2FS_SB(sb);
 	int err = 0;
 
@@ -2126,10 +2130,26 @@ int f2fs_sync_fs(struct super_block *sb, int sync)
 
 	if (sync) {
 		stat_inc_cp_call_count(sbi, TOTAL_CALL);
+		ktget(&stopwatch[0]);
 		err = f2fs_issue_checkpoint(sbi);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_issue_checkpoint);
 	}
 
 	return err;
+}
+
+KTDEF(f3fs_sync_fs);
+
+int f2fs_sync_fs(struct super_block *sb, int sync)
+{
+	int tmp;
+	ktime_t stopwatch[2];
+	ktget(&stopwatch[0]);
+	tmp = f2fs_sync_fs_internal(sb, sync);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_sync_fs);
+	return tmp;
 }
 
 static int f2fs_freeze(struct super_block *sb)
@@ -5829,8 +5849,166 @@ fail:
 	return err;
 }
 
+KTDEC(f3fs_file_write_iter);
+KTDEC(curseg_lock__allocate_data_block);
+KTDEC(sentry_lock);
+KTDEC(io_schedule_timeout__balance_dirty);
+KTDEC(df_wb_do_writeback);
+KTDEC(wb_check_start_all);
+KTDEC(wb_check_old_data_flush);
+KTDEC(df_wb_check_background_flush);
+KTDEC(writeback_sb_inodes);
+KTDEC(__writeback_inodes_wb);
+KTDEC(inode_sleep_on_writeback);
+KTDEC(f3fs_write_meta_pages);
+KTDEC(f3fs_write_data_pages);
+KTDEC(f3fs_write_node_pages);
+KTDEC(f3fs_write_cache_pages);
+KTDEC(f3fs_allocate_data_block);
+KTDEC(f3fs_write_single_data_page);
+KTDEC(f3fs_do_write_data_page);
+KTDEC(f3fs_balance_fs);
+KTDEC(has_enough_free_secs);
+KTDEF(__get_secs_required);
+KTDEF(has_curseg_enough_space);
+KTDEF(has_1);
+KTDEC(f3fs_submit_page_write);
+KTDEC(io_rwsem__submit_page_write);
+KTDEC(f3fs_write_checkpoint);
+KTDEC(f3fs_get_node_info);
+KTDEC(f3fs_outplace_write_data);
+KTDEC(nat_tree_lock_down_read);
+KTDEC(__lookup_nat_cache);
+KTDEC(if_1);
+KTDEC(if_2);
+KTDEC(if_3);
+KTDEC(if_4);
+KTDEC(if_5);
+KTDEC(if_6);
+KTDEC(if_7);
+KTDEC(locate_dirty_segment);
+KTDEC(f3fs_write_end);
+KTDEC(set_page_dirty);
+KTDEC(spin_lock__inode_lock);
+KTDEC(write_begin);
+KTDEC(begin_1);
+KTDEC(begin_2);
+KTDEC(begin_3);
+KTDEC(begin_4);
+KTDEC(write_end);
+KTDEC(locate_1);
+KTDEC(dirty_seglist_lock);
+KTDEC(get_valid_blocks);
+KTDEC(__x_dirty_segment);
+KTDEC(try_invalidate_one_locked);
+KTDEC(gc_lock);
+KTDEC(__get_victim);
+KTDEC(do_garbage_collect);
+KTDEC(gc_read_lock);
+KTDEC(se_lock_victim);
+KTDEC(gc_node_segment);
+KTDEC(gc_data_segment);
+KTDEC(i_gc_write_sem);
+KTDEC(i_gc_read_sem);
+KTDEC(move_data_page);
+KTDEC(io_lock);
+KTDEC(__submit_merged_bio);
+KTDEC(__bio_alloc);
+KTDEC(sub_1);
+KTDEC(sub_2);
+KTDEC(sub_3);
+KTDEC(sub_4);
+KTDEC(submit_read_bio);
+KTDEC(submit_write_bio);
+
 static void __exit exit_f2fs_fs(void)
 {
+	ktprint(0, f3fs_file_write_iter);
+	ktprint(0, f3fs_allocate_data_block);
+	ktprint(1, curseg_lock__allocate_data_block);
+	ktprint(0, io_schedule_timeout__balance_dirty);
+	ktprint(0, io_rwsem__submit_page_write);
+	ktprint(0, sentry_lock);
+	ktprint(0, nat_tree_lock_down_read);
+	ktprint(0, __lookup_nat_cache);
+
+	ktprint(0, write_begin);
+	ktprint(1, begin_1);
+	ktprint(1, begin_2);
+	ktprint(1, begin_3);
+	ktprint(1, begin_4);
+	ktprint(0, write_end);
+	ktprint(1, f3fs_write_end);
+	ktprint(2, set_page_dirty);
+	ktprint(3, spin_lock__inode_lock);
+
+	ktprint(0, df_wb_do_writeback);
+	ktprint(1, wb_check_start_all);
+	ktprint(1, wb_check_old_data_flush);
+	ktprint(1, df_wb_check_background_flush);
+	ktprint(2, writeback_sb_inodes);
+	ktprint(2, __writeback_inodes_wb);
+	ktprint(3, f3fs_write_meta_pages);
+	ktprint(3, f3fs_write_node_pages);
+	ktprint(3, f3fs_write_data_pages);
+	ktprint(4, f3fs_write_cache_pages);
+	ktprint(5, f3fs_write_single_data_page);
+	ktprint(6, f3fs_balance_fs);
+	ktprint(7, has_enough_free_secs);
+	ktprint(8, __get_secs_required);
+	ktprint(8, has_curseg_enough_space);
+	ktprint(8, has_1);
+	ktprint(7, gc_lock);
+	ktprint(8, __get_victim);
+	ktprint(9, gc_read_lock);
+	ktprint(9, se_lock_victim);
+	ktprint(8, do_garbage_collect);
+	ktprint(9, gc_node_segment);
+	ktprint(9, gc_data_segment);
+	ktprint(10, i_gc_write_sem);
+	ktprint(10, i_gc_read_sem);
+	ktprint(10, move_data_page);
+
+	ktprint(6, f3fs_do_write_data_page);
+	ktprint(7, f3fs_get_node_info);
+	ktprint(8, nat_tree_lock_down_read);
+	ktprint(8, __lookup_nat_cache);
+
+
+	ktprint(7, f3fs_outplace_write_data);
+	ktprint(8, f3fs_allocate_data_block);
+	ktprint(9, curseg_lock__allocate_data_block);
+	ktprint(9, sentry_lock);
+	ktprint(9, if_1);
+	ktprint(9, if_2);
+	ktprint(9, if_3);
+	ktprint(9, if_4);
+	ktprint(9, if_5);
+	ktprint(9, if_6);
+	ktprint(9, if_7);
+	ktprint(0, try_invalidate_one_locked);
+	ktprint(9, locate_dirty_segment);
+	ktprint(10, locate_1);
+	ktprint(10, dirty_seglist_lock);
+	ktprint(10, get_valid_blocks);
+	ktprint(10, __x_dirty_segment);
+
+	ktprint(8, f3fs_submit_page_write);
+	ktprint(9, io_rwsem__submit_page_write);
+	ktprint(9, io_lock);
+	ktprint(9, __submit_merged_bio);
+	ktprint(9, __bio_alloc);
+	ktprint(9, sub_1);
+	ktprint(9, sub_2);
+	ktprint(9, sub_3);
+	ktprint(9, sub_4);
+
+	ktprint(2, inode_sleep_on_writeback);
+
+	ktprint(0, f3fs_write_checkpoint);
+	ktprint(0, submit_read_bio);
+	ktprint(0, submit_write_bio);
+
 	unregister_filesystem(&f2fs_fs_type);
 	f2fs_destroy_xattr_cache();
 	f2fs_destroy_casefold_cache();

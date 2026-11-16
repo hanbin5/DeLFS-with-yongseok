@@ -21,6 +21,7 @@
 #include "xattr.h"
 #include "acl.h"
 #include <trace/events/f2fs.h>
+#include "calc/calclock.h"
 
 static inline bool is_extension_exist(const unsigned char *s, const char *sub,
 						bool tmp_ext, bool tmp_dot)
@@ -365,9 +366,16 @@ fail_drop:
 	return ERR_PTR(err);
 }
 
+KTDEF(f3fs_new_inode);
+KTDEF(f3fs_lock_op_create);
+KTDEF(f3fs_add_link);
+KTDEF(f3fs_alloc_nid_done);
+KTDEF(d_instantiate_new);
+
 static int f2fs_create(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode, bool excl)
 {
+	ktime_t stopwatch[2];
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct f2fs_lock_context lc;
 	struct inode *inode;
@@ -383,7 +391,10 @@ static int f2fs_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (err)
 		return err;
 
+	ktget(&stopwatch[0]);
 	inode = f2fs_new_inode(idmap, dir, mode, dentry->d_name.name);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_new_inode);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
 
@@ -392,15 +403,27 @@ static int f2fs_create(struct mnt_idmap *idmap, struct inode *dir,
 	inode->i_mapping->a_ops = &f2fs_dblock_aops;
 	ino = inode->i_ino;
 
+	ktget(&stopwatch[0]);
 	f2fs_lock_op(sbi, &lc);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_lock_op_create);
+	ktget(&stopwatch[0]);
 	err = f2fs_add_link(dentry, inode);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_add_link);
 	if (err)
 		goto out;
 	f2fs_unlock_op(sbi, &lc);
 
+	ktget(&stopwatch[0]);
 	f2fs_alloc_nid_done(sbi, ino);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_alloc_nid_done);
 
+	ktget(&stopwatch[0]);
 	d_instantiate_new(dentry, inode);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, d_instantiate_new);
 
 	if (IS_DIRSYNC(dir))
 		f2fs_sync_fs(sbi->sb, 1);

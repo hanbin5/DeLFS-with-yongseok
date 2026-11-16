@@ -22,6 +22,7 @@
 #include "gc.h"
 #include "iostat.h"
 #include <trace/events/f2fs.h>
+#include "calc/calclock.h"
 
 
 static struct kmem_cache *victim_entry_slab;
@@ -1729,6 +1730,10 @@ out:
 	return err;
 }
 
+KTDEF(i_gc_write_sem);
+KTDEF(i_gc_read_sem);
+KTDEF(move_data_page);
+
 /*
  * This function tries to get parent node of victim data block, and identifies
  * data block validity. If the block is valid, copy that with cold status and
@@ -1740,6 +1745,7 @@ static int gc_data_segment(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 		struct gc_inode_list *gc_list, unsigned int segno, int gc_type,
 		bool force_migrate, struct blk_plug *plug)
 {
+	ktime_t stopwatch[2];
 	struct super_block *sb = sbi->sb;
 	struct f2fs_summary *entry;
 	block_t start_addr;
@@ -1825,12 +1831,17 @@ next_step:
 				return submitted;
 			}
 
+			ktget(&stopwatch[0]);
 			if (!f2fs_down_write_trylock(
 				&F2FS_I(inode)->i_gc_rwsem[WRITE])) {
+				ktget(&stopwatch[1]);
+				ktput(stopwatch, i_gc_write_sem);
 				iput(inode);
 				atomic64_inc(&sbi->skipped_gc_rwsem);
 				continue;
 			}
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, i_gc_write_sem);
 
 
 			start_bidx = f2fs_start_bidx_of_node(nofs, inode) +
@@ -1869,19 +1880,29 @@ next_step:
 			int err;
 
 			if (S_ISREG(inode->i_mode)) {
+				ktget(&stopwatch[0]);
 				if (!f2fs_down_write_trylock(&fi->i_gc_rwsem[WRITE])) {
+					ktget(&stopwatch[1]);
+					ktput(stopwatch, i_gc_write_sem);
 
 					atomic64_inc(&sbi->skipped_gc_rwsem);
 					continue;
 				}
+				ktget(&stopwatch[1]);
+				ktput(stopwatch, i_gc_write_sem);
 
+				ktget(&stopwatch[0]);
 				if (!f2fs_down_write_trylock(
 						&fi->i_gc_rwsem[READ])) {
+					ktget(&stopwatch[1]);
+					ktput(stopwatch, i_gc_read_sem);
 
 					atomic64_inc(&sbi->skipped_gc_rwsem);
 					f2fs_up_write(&fi->i_gc_rwsem[WRITE]);
 					continue;
 				}
+				ktget(&stopwatch[1]);
+				ktput(stopwatch, i_gc_read_sem);
 
 				locked = true;
 
@@ -1891,12 +1912,15 @@ next_step:
 
 			start_bidx = f2fs_start_bidx_of_node(nofs, inode)
 								+ ofs_in_node;
+			ktget(&stopwatch[0]);
 			if (f2fs_meta_inode_gc_required(inode))
 				err = move_data_block(inode, start_bidx,
 							gc_type, segno, off);
 			else
 				err = move_data_page(inode, start_bidx, gc_type,
 								segno, off);
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, move_data_page);
 
 			if (!err && (gc_type == FG_GC ||
 					f2fs_meta_inode_gc_required(inode)))
@@ -1920,9 +1944,13 @@ next_step:
 	return submitted;
 }
 
+KTDEF(gc_read_lock);
+KTDEF(se_lock_victim);
+
 static int __get_victim(struct f2fs_sb_info *sbi, unsigned int *victim,
 			int gc_type, bool one_time, int cpu)
 {
+	ktime_t stopwatch[2];
 	struct sit_info *sit_i = SIT_I(sbi);
 	struct rw_semaphore *se_lock;
 	int ret;
@@ -1935,7 +1963,10 @@ static int __get_victim(struct f2fs_sb_info *sbi, unsigned int *victim,
 
 	se_lock = per_cpu_ptr(sit_i->percore_sentry_lock, cpu);
 
+	ktget(&stopwatch[0]);
 	down_write(se_lock);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, se_lock_victim);
 
 	ret = f2fs_get_victim(sbi, victim, gc_type,
 			      NO_CHECK_TYPE, LFS, 0, one_time, cpu);
@@ -1958,11 +1989,15 @@ static int __get_victim(struct f2fs_sb_info *sbi, unsigned int *victim,
 }
 
 
+KTDEF(gc_node_segment);
+KTDEF(gc_data_segment);
+
 static int do_garbage_collect(struct f2fs_sb_info *sbi,
 				unsigned int start_segno,
 				struct gc_inode_list *gc_list, int gc_type,
 				bool force_migrate, bool one_time)
 {
+	ktime_t stopwatch[2];
 	struct blk_plug plug;
 
 	unsigned int segno = start_segno;
@@ -2131,13 +2166,20 @@ static int do_garbage_collect(struct f2fs_sb_info *sbi,
 			 *    - down_read(sentry_lock) - change_curseg()
 			 *                               - lock_page(sum_page)
 			 */
-			if (type == SUM_TYPE_NODE)
+			if (type == SUM_TYPE_NODE) {
+				ktget(&stopwatch[0]);
 				submitted += gc_node_segment(sbi, sum->entries,
 						cur_segno, gc_type, &plug);
-			else
+				ktget(&stopwatch[1]);
+				ktput(stopwatch, gc_node_segment);
+			} else {
+				ktget(&stopwatch[0]);
 				submitted += gc_data_segment(sbi, sum->entries,
 						gc_list, cur_segno,
 						gc_type, force_migrate, &plug);
+				ktget(&stopwatch[1]);
+				ktput(stopwatch, gc_data_segment);
+			}
 
 			stat_inc_gc_seg_count(sbi, data_type, gc_type);
 			sbi->gc_reclaimed_segs[sbi->gc_mode]++;
@@ -2176,8 +2218,13 @@ stop:
 	return seg_freed;
 }
 
+KTDEC(gc_lock);
+KTDEF(__get_victim);
+KTDEF(do_garbage_collect);
+
 int f2fs_gc(struct f2fs_sb_info *sbi, struct f2fs_gc_control *gc_control, int cpu)
 {
+	ktime_t stopwatch[2];
 	int gc_type = gc_control->init_gc_type;
 	unsigned int segno = gc_control->victim_segno;
 
@@ -2217,7 +2264,10 @@ int f2fs_gc(struct f2fs_sb_info *sbi, struct f2fs_gc_control *gc_control, int cp
 		 * reclaimable prefree segments already exist.
 		 */
 		if (prefree_segments(sbi)) {
+			ktget(&stopwatch[0]);
 			f2fs_down_write(&sbi->gc_lock);
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, gc_lock);
 
 			if (prefree_segments(sbi)) {
 				stat_inc_cp_call_count(sbi, TOTAL_CALL);
@@ -2270,9 +2320,15 @@ retry:
 	 */
 	segno = gc_control->victim_segno;
 
+	ktget(&stopwatch[0]);
 	f2fs_down_read(&sbi->gc_lock);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, gc_read_lock);
 
+	ktget(&stopwatch[0]);
 	ret = __get_victim(sbi, &segno, gc_type, gc_control->one_time, cpu);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, __get_victim);
 
 	/*
 	 * Second defense line:
@@ -2299,9 +2355,12 @@ retry:
 		goto stop;
 	}
 
+	ktget(&stopwatch[0]);
 	seg_freed = do_garbage_collect(sbi, segno, &gc_list, gc_type,
 				gc_control->should_migrate_blocks,
 				gc_control->one_time);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, do_garbage_collect);
 
 	if (seg_freed < 0) {
 		ret = seg_freed;
@@ -2344,7 +2403,10 @@ retry:
 		if (skipped_round > MAX_SKIP_GC_COUNT &&
 				skipped_round * 2 >= round) {
 			f2fs_up_read(&sbi->gc_lock);
+			ktget(&stopwatch[0]);
 			f2fs_down_write(&sbi->gc_lock);
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, gc_lock);
 			stat_inc_cp_call_count(sbi, TOTAL_CALL);
 			ret = f2fs_write_checkpoint(sbi, &cpc);
 			f2fs_up_write(&sbi->gc_lock);
@@ -2364,7 +2426,10 @@ retry:
 	if (free_sections(sbi) <= upper_secs + NR_GC_CHECKPOINT_SECS &&
 				prefree_segments(sbi)) {
 		f2fs_up_read(&sbi->gc_lock);
+		ktget(&stopwatch[0]);
 		f2fs_down_write(&sbi->gc_lock);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, gc_lock);
 
 		if (free_sections(sbi) <= upper_secs + NR_GC_CHECKPOINT_SECS &&
 					prefree_segments(sbi)) {

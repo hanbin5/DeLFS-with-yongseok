@@ -7,6 +7,7 @@
 #include "f2fs.h"
 #include "segment.h"
 #include "oldinv.h"
+#include "calc/calclock.h"
 
 #define OLDINV_MAX_BATCH 256
 #define OLDINV_HIGH_WATERMARK 4096
@@ -63,8 +64,11 @@ static void oldinv_wait_quiescent(struct oldinv_worker *wk)
                 atomic_read(&wk->running) == 0);
 }
 
-static bool try_invalidate_one_locked(struct f2fs_sb_info *sbi, block_t blk)
+KTDEC(locate_dirty_segment);
+
+static bool try_invalidate_one_locked_internal(struct f2fs_sb_info *sbi, block_t blk)
 {
+        ktime_t stopwatch[2];
         unsigned int seg = GET_SEGNO(sbi, blk);
         unsigned int off;
         struct seg_entry *se;
@@ -83,14 +87,34 @@ static bool try_invalidate_one_locked(struct f2fs_sb_info *sbi, block_t blk)
         update_segment_mtime(sbi, blk, 0);
         update_sit_entry(sbi, blk, -1);
 
+        ktget(&stopwatch[0]);
         locate_dirty_segment(sbi, seg);
+        ktget(&stopwatch[1]);
+        ktput(stopwatch, locate_dirty_segment);
 
         return true;
 }
 
+KTDEF(try_invalidate_one_locked);
+
+static bool try_invalidate_one_locked(struct f2fs_sb_info *sbi, block_t blk)
+{
+	ktime_t stopwatch[2];
+	bool tmp;
+	ktget(&stopwatch[0]);
+	tmp = try_invalidate_one_locked_internal(sbi, blk);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, try_invalidate_one_locked);
+
+	return tmp;
+}
+
+
+KTDEC(sentry_lock);
 
 static int oldinv_thread(void *data)
 {
+	ktime_t stopwatch[2];
 	struct oldinv_worker *wk = data;
 	struct f2fs_sb_info *sbi = wk->sbi;
 	struct sit_info *sit_i = SIT_I(sbi);
@@ -117,7 +141,10 @@ static int oldinv_thread(void *data)
 			atomic_inc(&wk->running);
 			spin_unlock(&wk->qlock);
 
+			ktget(&stopwatch[0]);
 			down_write(se_lock);
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, sentry_lock);
 			try_invalidate_one_locked(sbi, it->blkaddr);
 			up_write(se_lock);
 
@@ -159,6 +186,7 @@ bool oldinv_has_pending(struct f2fs_sb_info *sbi)
 
 void oldinv_enqueue(struct f2fs_sb_info *sbi, block_t old_blkaddr)
 {
+	ktime_t stopwatch[2];
 	unsigned int seg = GET_SEGNO(sbi, old_blkaddr);
 	int sentry_cpu;
 	struct oldinv_worker *wk = NULL;
@@ -200,7 +228,10 @@ void oldinv_enqueue(struct f2fs_sb_info *sbi, block_t old_blkaddr)
 	}
 
 	if (force_sync) {
+		ktget(&stopwatch[0]);
 		down_write(se_lock);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, sentry_lock);
 
 		try_invalidate_one_locked(sbi, old_blkaddr);
 		up_write(se_lock);

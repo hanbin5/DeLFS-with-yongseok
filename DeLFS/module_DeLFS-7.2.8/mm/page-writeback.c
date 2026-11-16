@@ -42,6 +42,9 @@
 #include <linux/writeback.h>
 
 #include "../dflush.h"
+#include "../calc/calclock.h"
+KTDEF(io_schedule_timeout__balance_dirty);
+KTDEF(df_wb_do_writeback);
 
 int df_balance_dirty_pages_ratelimited_async(struct address_space *mapping)
 {

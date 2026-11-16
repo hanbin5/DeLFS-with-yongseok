@@ -24,6 +24,7 @@
 #include "iostat.h"
 #include "oldinv.h"	/* DeLFS deLLC (B) */
 #include <trace/events/f2fs.h>
+#include "calc/calclock.h"
 
 static inline void get_lock_elapsed_time(struct f2fs_time_stat *ts)
 {
@@ -573,7 +574,7 @@ redirty_out:
 	return false;
 }
 
-static int f2fs_write_meta_pages(struct address_space *mapping,
+static int f2fs_write_meta_pages_internal(struct address_space *mapping,
 				struct writeback_control *wbc)
 {
 	struct f2fs_sb_info *sbi = F2FS_M_SB(mapping);
@@ -604,6 +605,20 @@ skip_write:
 	wbc->pages_skipped += get_pages(sbi, F2FS_DIRTY_META);
 	trace_f2fs_writepages(mapping->host, wbc, META);
 	return 0;
+}
+
+KTDEF(f3fs_write_meta_pages);
+
+static int f2fs_write_meta_pages(struct address_space *mapping,
+				struct writeback_control *wbc)
+{
+	int tmp;
+	ktime_t stopwatch[2];
+	ktget(&stopwatch[0]);
+	tmp = f2fs_write_meta_pages_internal(mapping, wbc);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_write_meta_pages);
+	return tmp;
 }
 
 long f2fs_sync_meta_pages(struct f2fs_sb_info *sbi, long nr_to_write,
@@ -1265,8 +1280,11 @@ static void __remove_dirty_inode(struct inode *inode, enum inode_type type)
 	stat_dec_dirty_inode(F2FS_I_SB(inode), type);
 }
 
+KTDEF(spin_lock__inode_lock);
+
 void f2fs_update_dirty_folio(struct inode *inode, struct folio *folio)
 {
+	ktime_t stopwatch[2];
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	enum inode_type type = S_ISDIR(inode->i_mode) ? DIR_INODE : FILE_INODE;
 
@@ -1274,11 +1292,15 @@ void f2fs_update_dirty_folio(struct inode *inode, struct folio *folio)
 			!S_ISLNK(inode->i_mode))
 		return;
 
+	ktget(&stopwatch[0]);
 	spin_lock(&sbi->inode_lock[type]);
 	if (type != FILE_INODE || test_opt(sbi, DATA_FLUSH))
 		__add_dirty_inode(inode, type);
 	inode_inc_dirty_pages(inode);
 	spin_unlock(&sbi->inode_lock[type]);
+
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, spin_lock__inode_lock);
 
 	folio_set_f2fs_reference(folio);
 }
@@ -1933,7 +1955,7 @@ static int do_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 	return unlikely(f2fs_cp_error(sbi)) ? -EIO : 0;
 }
 
-int f2fs_write_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
+static int f2fs_write_checkpoint_internal(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 {
 	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
 	struct f2fs_lock_context lc;
@@ -2052,6 +2074,19 @@ out:
 	if (cpc->reason != CP_RESIZE)
 		f2fs_up_write_trace(&sbi->cp_global_sem, &lc);
 	return err;
+}
+
+KTDEF(f3fs_write_checkpoint);
+
+int f2fs_write_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
+{
+	int tmp;
+	ktime_t stopwatch[2];
+	ktget(&stopwatch[0]);
+	tmp = f2fs_write_checkpoint_internal(sbi, cpc);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_write_checkpoint);
+	return tmp;
 }
 
 void f2fs_init_ino_entry_info(struct f2fs_sb_info *sbi)
@@ -2182,8 +2217,15 @@ static void init_ckpt_req(struct ckpt_req *req)
 	req->queue_time = ktime_get();
 }
 
+KTDEF(f3fs_down_write_gc_lock);
+KTDEF(__write_checkpoint_sync);
+KTDEF(wake_up_ckpt_wait_queue);
+KTDEF(wait_for_completion);
+KTDEF(flush_remained_ckpt_reqs);
+
 int f2fs_issue_checkpoint(struct f2fs_sb_info *sbi)
 {
+	ktime_t stopwatch[2];
 	struct ckpt_req_control *cprc = &sbi->cprc_info;
 	struct ckpt_req req;
 	struct cp_control cpc;
@@ -2194,15 +2236,23 @@ int f2fs_issue_checkpoint(struct f2fs_sb_info *sbi)
 		struct f2fs_lock_context lc;
 		int ret;
 
+		ktget(&stopwatch[0]);
 		f2fs_down_write_trace(&sbi->gc_lock, &lc);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_down_write_gc_lock);
 		ret = f2fs_write_checkpoint(sbi, &cpc);
 		f2fs_up_write_trace(&sbi->gc_lock, &lc);
 
 		return ret;
 	}
 
-	if (!cprc->f2fs_issue_ckpt)
-		return __write_checkpoint_sync(sbi);
+	if (!cprc->f2fs_issue_ckpt) {
+		ktget(&stopwatch[0]);
+		int tmp = __write_checkpoint_sync(sbi);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, __write_checkpoint_sync);
+		return tmp;
+	}
 
 	init_ckpt_req(&req);
 
@@ -2216,13 +2266,25 @@ int f2fs_issue_checkpoint(struct f2fs_sb_info *sbi)
 	 */
 	smp_mb();
 
-	if (waitqueue_active(&cprc->ckpt_wait_queue))
+	if (waitqueue_active(&cprc->ckpt_wait_queue)) {
+		ktget(&stopwatch[0]);
 		wake_up(&cprc->ckpt_wait_queue);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, wake_up_ckpt_wait_queue);
+	}
 
-	if (cprc->f2fs_issue_ckpt)
+	if (cprc->f2fs_issue_ckpt) {
+		ktget(&stopwatch[0]);
 		wait_for_completion(&req.wait);
-	else
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, wait_for_completion);
+	}
+	else {
+		ktget(&stopwatch[0]);
 		flush_remained_ckpt_reqs(sbi, &req);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, flush_remained_ckpt_reqs);
+	}
 
 	if (unlikely(req.delta_time >= CP_LONG_LATENCY_THRESHOLD)) {
 		f2fs_warn_ratelimited(sbi,

@@ -36,6 +36,7 @@
 #include "dflush.h"
 #include <trace/events/f2fs.h>
 #include <uapi/linux/f2fs.h>
+#include "calc/calclock.h"
 
 static int fill_zero(struct inode *inode, pgoff_t index,
 					loff_t start, loff_t len);
@@ -5377,7 +5378,7 @@ out:
 	return ret;
 }
 
-static ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+static ssize_t f2fs_file_write_iter_internal(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	const loff_t orig_pos = iocb->ki_pos;
@@ -5489,6 +5490,19 @@ out:
 					  bufio_start_pos + ret - 1);
 
 	return ret;
+}
+
+KTDEF(f3fs_file_write_iter);
+
+static ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+	ssize_t tmp;
+	ktime_t stopwatch[2];
+	ktget(&stopwatch[0]);
+	tmp = f2fs_file_write_iter_internal(iocb, from);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_file_write_iter);
+	return tmp;
 }
 
 static int f2fs_file_fadvise(struct file *filp, loff_t offset, loff_t len,

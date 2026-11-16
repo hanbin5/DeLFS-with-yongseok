@@ -7,6 +7,7 @@
  */
 #include <linux/blkdev.h>
 #include <linux/backing-dev.h>
+#include "calc/calclock.h"
 
 /* constant macro */
 #define NULL_SEGNO			((unsigned int)(~0))
@@ -799,17 +800,28 @@ static inline int __get_secs_required(struct f2fs_sb_info *sbi)
 			DIV_ROUND_UP(total_data_blocks, CAP_BLKS_PER_SEC(sbi));
 }
 
+KTDEC(__get_secs_required);
+KTDEC(has_1);
+
 static inline bool has_not_enough_free_secs(struct f2fs_sb_info *sbi,
 					int freed, int needed)
 {
+	ktime_t stopwatch[2];
 	unsigned int free_secs, required_secs;
 
 	if (unlikely(is_sbi_flag_set(sbi, SBI_POR_DOING)))
 		return false;
 
+	ktget(&stopwatch[0]);
 	free_secs = free_sections(sbi) + freed;
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, has_1);
+
+	ktget(&stopwatch[0]);
 	required_secs = needed + reserved_sections(sbi) +
 			__get_secs_required(sbi);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, __get_secs_required);
 
 	return free_secs < required_secs;
 }
