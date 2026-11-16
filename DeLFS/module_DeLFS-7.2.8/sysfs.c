@@ -1843,26 +1843,53 @@ static int __maybe_unused discard_plist_seq_show(struct seq_file *seq,
 		return 0;
 
 	if (dcc) {
-		mutex_lock(&dcc->cmd_lock);
-		for (i = 0; i < MAX_PLIST_NUM; i++) {
-			struct list_head *pend_list;
-			struct discard_cmd *dc, *tmp;
 
-			if (i % 8 == 0)
-				seq_printf(seq, "  %-3d", i);
-			count = 0;
-			pend_list = &dcc->pend_list[i];
-			list_for_each_entry_safe(dc, tmp, pend_list, list)
-				count++;
-			if (count)
-				seq_printf(seq, " %7d", count);
-			else
-				seq_puts(seq, "       .");
-			if (i % 8 == 7)
-				seq_putc(seq, '\n');
+		int dcc_cpu;
+		for_each_online_cpu(dcc_cpu) {
+			struct discard_set *ds = per_cpu_ptr(dcc->ds, dcc_cpu);
+			mutex_lock(&ds->p_cmd_lock);
+			for (i = 0; i < MAX_PLIST_NUM; i++) {
+				struct list_head *p_pend_list;
+				struct discard_cmd *dc, *tmp;
+
+				if (i % 8 == 0)
+					seq_printf(seq, "  %-3d", i);
+				count = 0;
+				p_pend_list = &ds->p_pend_list[i];
+				list_for_each_entry_safe(dc, tmp, p_pend_list, list)
+					count++;
+				if (count)
+					seq_printf(seq, " %7d", count);
+				else
+					seq_puts(seq, "       .");
+				if (i % 8 == 7)
+					seq_putc(seq, '\n');
+			}
+			seq_putc(seq, '\n');
+			mutex_unlock(&ds->p_cmd_lock);
 		}
-		seq_putc(seq, '\n');
-		mutex_unlock(&dcc->cmd_lock);
+
+//		mutex_lock(&dcc->cmd_lock);
+//		for (i = 0; i < MAX_PLIST_NUM; i++) {
+//			struct list_head *pend_list;
+//			struct discard_cmd *dc, *tmp;
+//
+//			if (i % 8 == 0)
+//				seq_printf(seq, "  %-3d", i);
+//			count = 0;
+//			pend_list = &dcc->pend_list[i];
+//			list_for_each_entry_safe(dc, tmp, pend_list, list)
+//				count++;
+//			if (count)
+//				seq_printf(seq, " %7d", count);
+//			else
+//				seq_puts(seq, "       .");
+//			if (i % 8 == 7)
+//				seq_putc(seq, '\n');
+//		}
+//		seq_putc(seq, '\n');
+//		mutex_unlock(&dcc->cmd_lock);
+
 	}
 
 	return 0;
