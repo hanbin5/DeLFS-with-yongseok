@@ -2090,8 +2090,7 @@ static void f2fs_put_super(struct super_block *sb)
 	fscrypt_free_dummy_policy(&F2FS_OPTION(sbi).dummy_enc_policy);
 	destroy_percpu_info(sbi);
 	f2fs_destroy_iostat(sbi);
-	for (i = 0; i < NR_PAGE_TYPE; i++)
-		kfree(sbi->write_io[i]);
+	f2fs_destroy_write_merge_io(sbi);	/* DeLFS per-core bio */
 #if IS_ENABLED(CONFIG_UNICODE)
 	utf8_unload(sb->s_encoding);
 #endif
@@ -5573,8 +5572,7 @@ free_percpu:
 free_iostat:
 	f2fs_destroy_iostat(sbi);
 free_bio_info:
-	for (i = 0; i < NR_PAGE_TYPE; i++)
-		kfree(sbi->write_io[i]);
+	f2fs_destroy_write_merge_io(sbi);	/* DeLFS per-core bio */
 
 #if IS_ENABLED(CONFIG_UNICODE)
 	utf8_unload(sb->s_encoding);
@@ -5663,8 +5661,17 @@ static void kill_f2fs_super(struct super_block *sb)
 			struct cp_control cpc = {
 				.reason = CP_UMOUNT,
 			};
+			struct f2fs_lock_context lc;
+
 			stat_inc_cp_call_count(sbi, TOTAL_CALL);
+			/*
+			 * DeLFS: GC runs on every core under gc_lock held for
+			 * read, so the umount checkpoint takes it for write to
+			 * exclude all of them (as 6.6.8 DeLFS does).
+			 */
+			f2fs_down_write_trace(&sbi->gc_lock, &lc);
 			f2fs_write_checkpoint(sbi, &cpc);
+			f2fs_up_write_trace(&sbi->gc_lock, &lc);
 		}
 
 		if (is_sbi_flag_set(sbi, SBI_IS_RECOVERED) && f2fs_readonly(sb))
@@ -5698,12 +5705,12 @@ static int f2fs_init_fs_context(struct fs_context *fc)
 
 static struct file_system_type f2fs_fs_type = {
 	.owner		= THIS_MODULE,
-	.name		= "f2fs",
+	.name		= "delfs",	/* DeLFS: was "f2fs" */
 	.init_fs_context = f2fs_init_fs_context,
 	.kill_sb	= kill_f2fs_super,
 	.fs_flags	= FS_REQUIRES_DEV | FS_ALLOW_IDMAP,
 };
-MODULE_ALIAS_FS("f2fs");
+MODULE_ALIAS_FS("delfs");
 
 static int __init init_inodecache(void)
 {

@@ -21,6 +21,7 @@
 #include <linux/fiemap.h>
 #include <linux/iomap.h>
 #include <linux/fserror.h>
+#include <linux/percpu.h>	/* DeLFS per-core bio */
 
 #include "f2fs.h"
 #include "node.h"
@@ -636,48 +637,97 @@ static bool __has_merged_page(struct bio *bio, struct inode *inode,
 	return false;
 }
 
+/*
+ * DeLFS per-core bio: allocate one set of write bios (DATA x3, NODE x3,
+ * META x1) for every online CPU instead of one set per sb.
+ * CPUs that come online after mount have no set (as in 6.6.8 DeLFS).
+ */
 int f2fs_init_write_merge_io(struct f2fs_sb_info *sbi)
 {
-	int i;
+	struct wrap_f2fs_bio_info *wio;
+	int i, cpu;
 
-	for (i = 0; i < NR_PAGE_TYPE; i++) {
-		int n = (i == META) ? 1 : NR_TEMP_TYPE;
-		int j;
+	/* zeroed, so every wio->write_io[i] starts as NULL */
+	sbi->wrap_write_io = alloc_percpu(struct wrap_f2fs_bio_info);
+	if (!sbi->wrap_write_io)
+		return -ENOMEM;
 
-		sbi->write_io[i] = f2fs_kmalloc(sbi,
+	for_each_online_cpu(cpu) {
+		wio = per_cpu_ptr(sbi->wrap_write_io, cpu);
+
+		for (i = 0; i < NR_PAGE_TYPE; i++) {
+			int n = (i == META) ? 1 : NR_TEMP_TYPE;
+			int j;
+
+			wio->write_io[i] = f2fs_kmalloc(sbi,
 				array_size(n, sizeof(struct f2fs_bio_info)),
 				GFP_KERNEL);
-		if (!sbi->write_io[i])
-			return -ENOMEM;
+			if (!wio->write_io[i])
+				goto out_err;
 
-		for (j = HOT; j < n; j++) {
-			struct f2fs_bio_info *io = &sbi->write_io[i][j];
+			for (j = HOT; j < n; j++) {
+				struct f2fs_bio_info *io = &wio->write_io[i][j];
 
-			init_f2fs_rwsem_trace(&io->io_rwsem, sbi,
-						LOCK_NAME_IO_RWSEM);
-			io->sbi = sbi;
-			io->bio = NULL;
-			io->last_block_in_bio = 0;
-			spin_lock_init(&io->io_lock);
-			INIT_LIST_HEAD(&io->io_list);
-			INIT_LIST_HEAD(&io->bio_list);
-			init_f2fs_rwsem(&io->bio_list_lock);
+				init_f2fs_rwsem_trace(&io->io_rwsem, sbi,
+							LOCK_NAME_IO_RWSEM);
+				io->sbi = sbi;
+				io->bio = NULL;
+				io->last_block_in_bio = 0;
+				spin_lock_init(&io->io_lock);
+				INIT_LIST_HEAD(&io->io_list);
+				INIT_LIST_HEAD(&io->bio_list);
+				init_f2fs_rwsem(&io->bio_list_lock);
 #ifdef CONFIG_BLK_DEV_ZONED
-			init_completion(&io->zone_wait);
-			io->zone_pending_bio = NULL;
-			io->bi_private = NULL;
+				init_completion(&io->zone_wait);
+				io->zone_pending_bio = NULL;
+				io->bi_private = NULL;
 #endif
+			}
 		}
 	}
 
 	return 0;
+
+out_err:
+	/*
+	 * DeLFS per-core bio: free what was allocated and clear the pointer,
+	 * so the free_bio_info path in f2fs_fill_super() does not free the
+	 * sets again.
+	 */
+	f2fs_destroy_write_merge_io(sbi);
+	return -ENOMEM;
 }
 
+/*
+ * DeLFS per-core bio: free every CPU's bio set (umount, mount error path).
+ * Walks all possible CPUs, so a CPU that went offline after mount does not
+ * leak its set.  Safe on a partly allocated or already freed set.
+ */
+void f2fs_destroy_write_merge_io(struct f2fs_sb_info *sbi)
+{
+	int i, cpu;
+
+	if (!sbi->wrap_write_io)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		struct wrap_f2fs_bio_info *wio =
+			per_cpu_ptr(sbi->wrap_write_io, cpu);
+
+		for (i = 0; i < NR_PAGE_TYPE; i++)
+			kfree(wio->write_io[i]);
+	}
+	free_percpu(sbi->wrap_write_io);
+	sbi->wrap_write_io = NULL;
+}
+
+/* DeLFS per-core bio: submit the merged bio of @cpu's bio set */
 static void __f2fs_submit_merged_write(struct f2fs_sb_info *sbi,
-				enum page_type type, enum temp_type temp)
+				enum page_type type, enum temp_type temp, int cpu)
 {
 	enum page_type btype = PAGE_TYPE_OF_BIO(type);
-	struct f2fs_bio_info *io = sbi->write_io[btype] + temp;
+	struct wrap_f2fs_bio_info *wio = per_cpu_ptr(sbi->wrap_write_io, cpu);
+	struct f2fs_bio_info *io = wio->write_io[btype] + temp;
 	struct f2fs_lock_context lc;
 
 	f2fs_down_write_trace(&io->io_rwsem, &lc);
@@ -697,9 +747,16 @@ unlock_out:
 	f2fs_up_write_trace(&io->io_rwsem, &lc);
 }
 
+/*
+ * DeLFS per-core bio: with @force (no inode/folio/ino given), submit the
+ * bios of @cpu's set; f2fs_submit_merged_write() calls this for every
+ * online CPU.  Otherwise search every online CPU's bio for the
+ * inode/folio/ino and submit the ones that hold it; @cpu is unused.
+ */
 static void __submit_merged_write_cond(struct f2fs_sb_info *sbi,
 				struct inode *inode, struct folio *folio,
-				nid_t ino, enum page_type type, bool writeback)
+				nid_t ino, enum page_type type, bool writeback,
+				int cpu)
 {
 	enum temp_type temp;
 	bool ret = true;
@@ -708,15 +765,38 @@ static void __submit_merged_write_cond(struct f2fs_sb_info *sbi,
 	for (temp = HOT; temp < NR_TEMP_TYPE; temp++) {
 		if (!force)	{
 			enum page_type btype = PAGE_TYPE_OF_BIO(type);
-			struct f2fs_bio_info *io = sbi->write_io[btype] + temp;
-			struct f2fs_lock_context lc;
+			int local_cpu;
 
-			f2fs_down_read_trace(&io->io_rwsem, &lc);
-			ret = __has_merged_page(io->bio, inode, folio, ino);
-			f2fs_up_read_trace(&io->io_rwsem, &lc);
+			/* DeLFS per-core bio: search every CPU's bio */
+			ret = false;
+			for_each_online_cpu(local_cpu) {
+				struct wrap_f2fs_bio_info *wio =
+					per_cpu_ptr(sbi->wrap_write_io, local_cpu);
+				struct f2fs_bio_info *io = wio->write_io[btype] + temp;
+				struct f2fs_lock_context lc;
+				bool found;
+
+				f2fs_down_read_trace(&io->io_rwsem, &lc);
+				found = __has_merged_page(io->bio, inode, folio, ino);
+				f2fs_up_read_trace(&io->io_rwsem, &lc);
+				if (!found)
+					continue;
+
+				__f2fs_submit_merged_write(sbi, type, temp,
+							   local_cpu);
+				ret = true;
+				/*
+				 * DeLFS per-core bio: the folio is in one bio
+				 * only; once it is submitted, stop the CPU
+				 * loop too.
+				 */
+				if (writeback)
+					break;
+			}
+		} else {
+			__f2fs_submit_merged_write(sbi, type, temp, cpu);
 		}
 		if (ret) {
-			__f2fs_submit_merged_write(sbi, type, temp);
 			/*
 			 * For waitting writebck case, if the bio owned by the
 			 * folio is already submitted, we do not need to submit
@@ -734,20 +814,26 @@ static void __submit_merged_write_cond(struct f2fs_sb_info *sbi,
 
 void f2fs_submit_merged_write(struct f2fs_sb_info *sbi, enum page_type type)
 {
-	__submit_merged_write_cond(sbi, NULL, NULL, 0, type, false);
+	int cpu;
+
+	/* DeLFS per-core bio: submit the bios of every online CPU */
+	for_each_online_cpu(cpu)
+		__submit_merged_write_cond(sbi, NULL, NULL, 0, type, false, cpu);
 }
 
 void f2fs_submit_merged_write_cond(struct f2fs_sb_info *sbi,
 				struct inode *inode, struct folio *folio,
 				nid_t ino, enum page_type type)
 {
-	__submit_merged_write_cond(sbi, inode, folio, ino, type, false);
+	/* DeLFS per-core bio: cpu -1, searches all CPUs */
+	__submit_merged_write_cond(sbi, inode, folio, ino, type, false, -1);
 }
 
 void f2fs_submit_merged_write_folio(struct f2fs_sb_info *sbi,
 				struct folio *folio, enum page_type type)
 {
-	__submit_merged_write_cond(sbi, NULL, folio, 0, type, true);
+	/* DeLFS per-core bio: cpu -1, searches all CPUs */
+	__submit_merged_write_cond(sbi, NULL, folio, 0, type, true, -1);
 }
 
 void f2fs_flush_merged_writes(struct f2fs_sb_info *sbi)
@@ -827,10 +913,12 @@ static bool io_is_mergeable(struct f2fs_sb_info *sbi, struct bio *bio,
 	return io_type_is_mergeable(io, fio);
 }
 
+/* DeLFS per-core bio: add the IPU bio to @cpu's bio_list */
 static void add_bio_entry(struct f2fs_sb_info *sbi, struct bio *bio,
-				struct folio *folio, enum temp_type temp)
+				struct folio *folio, enum temp_type temp, int cpu)
 {
-	struct f2fs_bio_info *io = sbi->write_io[DATA] + temp;
+	struct wrap_f2fs_bio_info *wio = per_cpu_ptr(sbi->wrap_write_io, cpu);
+	struct f2fs_bio_info *io = wio->write_io[DATA] + temp;
 	struct bio_entry *be;
 
 	be = f2fs_kmem_cache_alloc(bio_entry_slab, GFP_NOFS, true, NULL);
@@ -860,7 +948,10 @@ static int add_ipu_page(struct f2fs_io_info *fio, struct bio **bio,
 	int ret = -EAGAIN;
 
 	for (temp = HOT; temp < NR_TEMP_TYPE && !found; temp++) {
-		struct f2fs_bio_info *io = sbi->write_io[DATA] + temp;
+		/* DeLFS per-core bio: look in fio->cpu's bio_list */
+		struct wrap_f2fs_bio_info *wio =
+			per_cpu_ptr(sbi->wrap_write_io, fio->cpu);
+		struct f2fs_bio_info *io = wio->write_io[DATA] + temp;
 		struct list_head *head = &io->bio_list;
 		struct bio_entry *be;
 
@@ -904,48 +995,60 @@ void f2fs_submit_merged_ipu_write(struct f2fs_sb_info *sbi,
 	enum temp_type temp;
 	bool found = false;
 	struct bio *target = bio ? *bio : NULL;
+	int cpu;
 
 	f2fs_bug_on(sbi, !target && !folio);
 
 	for (temp = HOT; temp < NR_TEMP_TYPE && !found; temp++) {
-		struct f2fs_bio_info *io = sbi->write_io[DATA] + temp;
-		struct list_head *head = &io->bio_list;
-		struct bio_entry *be;
+		/*
+		 * DeLFS per-core bio: search every online CPU's bio_list.
+		 * As in 6.6.8 DeLFS, there is no lockless list_empty() skip.
+		 */
+		for_each_online_cpu(cpu) {
+			struct wrap_f2fs_bio_info *wio;
+			struct f2fs_bio_info *io;
+			struct list_head *head;
+			struct bio_entry *be;
 
-		if (list_empty(head))
-			continue;
-
-		f2fs_down_read(&io->bio_list_lock);
-		list_for_each_entry(be, head, list) {
-			if (target)
-				found = (target == be->bio);
-			else
-				found = __has_merged_page(be->bio, NULL,
-							folio, 0);
 			if (found)
 				break;
-		}
-		f2fs_up_read(&io->bio_list_lock);
 
-		if (!found)
-			continue;
+			wio = per_cpu_ptr(sbi->wrap_write_io, cpu);
+			io = wio->write_io[DATA] + temp;
+			head = &io->bio_list;
 
-		found = false;
-
-		f2fs_down_write(&io->bio_list_lock);
-		list_for_each_entry(be, head, list) {
-			if (target)
-				found = (target == be->bio);
-			else
-				found = __has_merged_page(be->bio, NULL,
-							folio, 0);
-			if (found) {
-				target = be->bio;
-				del_bio_entry(be);
-				break;
+			f2fs_down_read(&io->bio_list_lock);
+			list_for_each_entry(be, head, list) {
+				if (target)
+					found = (target == be->bio);
+				else
+					found = __has_merged_page(be->bio, NULL,
+								folio, 0);
+				if (found)
+					break;
 			}
+			f2fs_up_read(&io->bio_list_lock);
+
+			if (!found)
+				continue;
+
+			found = false;
+
+			f2fs_down_write(&io->bio_list_lock);
+			list_for_each_entry(be, head, list) {
+				if (target)
+					found = (target == be->bio);
+				else
+					found = __has_merged_page(be->bio, NULL,
+								folio, 0);
+				if (found) {
+					target = be->bio;
+					del_bio_entry(be);
+					break;
+				}
+			}
+			f2fs_up_write(&io->bio_list_lock);
 		}
-		f2fs_up_write(&io->bio_list_lock);
 	}
 
 	if (found)
@@ -961,26 +1064,36 @@ void f2fs_submit_all_merged_ipu_writes(struct f2fs_sb_info *sbi)
 	struct bio_entry *be, *tmp;
 	struct f2fs_bio_info *io;
 	enum temp_type temp;
+	int cpu;
 
-	for (temp = HOT; temp < NR_TEMP_TYPE; temp++) {
-		LIST_HEAD(list);
+	/*
+	 * DeLFS per-core bio: this function is not in 6.6.8.  Submit the IPU
+	 * bios of every online CPU's set.
+	 */
+	for_each_online_cpu(cpu) {
+		struct wrap_f2fs_bio_info *wio =
+			per_cpu_ptr(sbi->wrap_write_io, cpu);
 
-		io = sbi->write_io[DATA] + temp;
+		for (temp = HOT; temp < NR_TEMP_TYPE; temp++) {
+			LIST_HEAD(list);
 
-		/* A lockless list_empty() check is safe here: any bios from
-		 * other kworkers that we miss will be submitted by those
-		 * kworkers accordingly.
-		 */
-		if (list_empty(&io->bio_list))
-			continue;
+			io = wio->write_io[DATA] + temp;
 
-		f2fs_down_write(&io->bio_list_lock);
-		list_splice_init(&io->bio_list, &list);
-		f2fs_up_write(&io->bio_list_lock);
+			/* A lockless list_empty() check is safe here: any bios
+			 * from other kworkers that we miss will be submitted by
+			 * those kworkers accordingly.
+			 */
+			if (list_empty(&io->bio_list))
+				continue;
 
-		list_for_each_entry_safe(be, tmp, &list, list) {
-			f2fs_submit_write_bio(sbi, be->bio, DATA);
-			del_bio_entry(be);
+			f2fs_down_write(&io->bio_list_lock);
+			list_splice_init(&io->bio_list, &list);
+			f2fs_up_write(&io->bio_list_lock);
+
+			list_for_each_entry_safe(be, tmp, &list, list) {
+				f2fs_submit_write_bio(sbi, be->bio, DATA);
+				del_bio_entry(be);
+			}
 		}
 	}
 }
@@ -1007,7 +1120,8 @@ alloc_new:
 		f2fs_set_bio_crypt_ctx(bio, folio->mapping->host,
 				folio->index, fio, GFP_NOIO);
 
-		add_bio_entry(fio->sbi, bio, data_folio, fio->temp);
+		/* DeLFS per-core bio: fio->cpu's bio_list */
+		add_bio_entry(fio->sbi, bio, data_folio, fio->temp, fio->cpu);
 	} else {
 		if (add_ipu_page(fio, &bio, data_folio))
 			goto alloc_new;
@@ -1050,7 +1164,14 @@ void f2fs_submit_page_write(struct f2fs_io_info *fio)
 {
 	struct f2fs_sb_info *sbi = fio->sbi;
 	enum page_type btype = PAGE_TYPE_OF_BIO(fio->type);
-	struct f2fs_bio_info *io = sbi->write_io[btype] + fio->temp;
+	/*
+	 * DeLFS per-core bio: use fio->cpu's bio set.  fio->cpu is the CPU
+	 * whose io_list the allocator put this fio on, which may differ from
+	 * the CPU we run on now.
+	 */
+	struct wrap_f2fs_bio_info *wio = per_cpu_ptr(sbi->wrap_write_io,
+						     fio->cpu);
+	struct f2fs_bio_info *io = wio->write_io[btype] + fio->temp;
 	struct folio *bio_folio;
 	struct f2fs_lock_context lc;
 	enum count_type type;
@@ -3246,8 +3367,16 @@ out:
 		folio_clear_f2fs_gcing(folio);
 	}
 	folio_unlock(folio);
+	/*
+	 * DeLFS dflush: do not run foreground balance/GC while a writer holds
+	 * this inode's i_rwsem.  With dflush, writeback is run by application
+	 * threads, and GC here can wait on inode locks or a checkpoint, which
+	 * can hang while i_rwsem is held.  The writer's deferred dflush runs
+	 * after inode_unlock(), so balancing still happens there.
+	 */
 	if (!S_ISDIR(inode->i_mode) && !IS_NOQUOTA(inode) &&
-			!F2FS_I(inode)->wb_task && allow_balance)
+			!F2FS_I(inode)->wb_task && allow_balance &&
+			!rwsem_is_locked(&inode->i_rwsem))
 		f2fs_balance_fs(sbi, need_balance_fs);
 
 	if (unlikely(f2fs_cp_error(sbi))) {
@@ -3562,6 +3691,10 @@ next:
 	return ret;
 }
 
+/*
+ * DeLFS serialization-free: no longer called.  __f2fs_write_data_pages()
+ * does not take sbi->writepages any more.  Kept as in 6.6.8 DeLFS.
+ */
 static inline bool __should_serialize_io(struct inode *inode,
 					struct writeback_control *wbc)
 {
@@ -3616,7 +3749,6 @@ static int __f2fs_write_data_pages(struct address_space *mapping,
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct blk_plug plug;
 	int ret;
-	bool locked = false;
 
 	/* skip writing if there is no dirty page in this inode */
 	if (!get_dirty_pages(inode) && wbc->sync_mode == WB_SYNC_NONE)
@@ -3648,11 +3780,13 @@ static int __f2fs_write_data_pages(struct address_space *mapping,
 		goto skip_write;
 	}
 
-	if (__should_serialize_io(inode, wbc)) {
-		mutex_lock(&sbi->writepages);
-		locked = true;
-	}
-
+	/*
+	 * DeLFS serialization-free: do not take the fs-wide sbi->writepages
+	 * mutex here.  It only keeps blocks of different files from mixing in
+	 * a segment (lower GC cost); it is not needed for consistency.  With
+	 * dflush, many writer threads run writeback and would queue on it.
+	 * Compressed files are not serialized either, as in 6.6.8 DeLFS.
+	 */
 	account_writeback(inode, true);
 
 	blk_start_plug(&plug);
@@ -3660,9 +3794,6 @@ static int __f2fs_write_data_pages(struct address_space *mapping,
 	blk_finish_plug(&plug);
 
 	account_writeback(inode, false);
-
-	if (locked)
-		mutex_unlock(&sbi->writepages);
 
 	if (wbc->sync_mode == WB_SYNC_ALL)
 		atomic_dec(&sbi->wb_sync_req[DATA]);

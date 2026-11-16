@@ -1790,6 +1790,14 @@ struct f2fs_gc_kthread {
 	unsigned int boost_gc_greedy;
 };
 
+/*
+ * DeLFS per-core bio: one set of write bios (the old sbi->write_io) per CPU,
+ * indexed by fio->cpu.
+ */
+struct wrap_f2fs_bio_info {
+	struct f2fs_bio_info *write_io[NR_PAGE_TYPE];
+};
+
 struct f2fs_sb_info {
 	struct super_block *sb;			/* pointer to VFS super block */
 	struct proc_dir_entry *s_proc;		/* proc entry */
@@ -1819,7 +1827,10 @@ struct f2fs_sb_info {
 	struct f2fs_sm_info *sm_info;		/* segment manager */
 
 	/* for bio operations */
-	struct f2fs_bio_info *write_io[NR_PAGE_TYPE];	/* for write bios */
+	/*
+	 * DeLFS per-core bio: sbi->write_io is replaced by a per-CPU set.
+	 */
+	struct wrap_f2fs_bio_info __percpu *wrap_write_io;	/* for write bios */
 	/* keep migration IO order for LFS mode */
 	struct f2fs_rwsem io_order_lock;
 	pgoff_t page_eio_ofs[NR_PAGE_TYPE];	/* EIO page offset */
@@ -4245,6 +4256,7 @@ void f2fs_destroy_bio_entry_cache(void);
 void f2fs_submit_read_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 			  enum page_type type);
 int f2fs_init_write_merge_io(struct f2fs_sb_info *sbi);
+void f2fs_destroy_write_merge_io(struct f2fs_sb_info *sbi);	/* DeLFS per-core bio */
 void f2fs_submit_merged_write(struct f2fs_sb_info *sbi, enum page_type type);
 void f2fs_submit_merged_write_cond(struct f2fs_sb_info *sbi,
 				struct inode *inode, struct folio *folio,

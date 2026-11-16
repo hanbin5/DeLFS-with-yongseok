@@ -32,24 +32,7 @@
 #include <linux/memcontrol.h>
 #include "internal.h"
 
-/*
- * Passed into wb_writeback(), essentially a subset of writeback_control
- */
-struct wb_writeback_work {
-	long nr_pages;
-	struct super_block *sb;
-	enum writeback_sync_modes sync_mode;
-	unsigned int tagged_writepages:1;
-	unsigned int for_kupdate:1;
-	unsigned int range_cyclic:1;
-	unsigned int for_background:1;
-	unsigned int for_sync:1;	/* sync(2) WB_SYNC_ALL writeback */
-	unsigned int auto_free:1;	/* free on completion */
-	enum wb_reason reason;		/* why was writeback initiated? */
-
-	struct list_head list;		/* pending work list */
-	struct wb_completion *done;	/* set if the caller waits */
-};
+/* DeLFS dflush: struct wb_writeback_work moved to <linux/writeback.h> */
 
 /*
  * If an inode is constantly having its pages dirtied, but then the
@@ -1580,7 +1563,7 @@ out:
  *                                           |
  *                                           +--> dequeue for IO
  */
-static void queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
+void wb_queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
 		     unsigned long dirtied_before)
 {
 	int moved;
@@ -1597,6 +1580,7 @@ static void queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
 		wb_io_lists_populated(wb);
 	trace_writeback_queue_io(wb, work, dirtied_before, moved);
 }
+EXPORT_SYMBOL_GPL(wb_queue_io);	/* DeLFS dflush */
 
 static int write_inode(struct inode *inode, struct writeback_control *wbc)
 {
@@ -1643,7 +1627,7 @@ void inode_wait_for_writeback(struct inode *inode)
  * held and drops it. It is aimed for callers not holding any inode reference
  * so once i_lock is dropped, inode can go away.
  */
-static void inode_sleep_on_writeback(struct inode *inode)
+void inode_sleep_on_writeback(struct inode *inode)
 	__releases(inode->i_lock)
 {
 	struct wait_bit_queue_entry wqe;
@@ -1661,6 +1645,7 @@ static void inode_sleep_on_writeback(struct inode *inode)
 		schedule();
 	finish_wait(wq_head, &wqe.wq_entry);
 }
+EXPORT_SYMBOL_GPL(inode_sleep_on_writeback);	/* DeLFS dflush */
 
 /*
  * Find proper writeback list for the inode depending on its current state and
@@ -1977,7 +1962,7 @@ static long writeback_chunk_size(struct super_block *sb,
  * unlock and relock that for each inode it ends up doing
  * IO for.
  */
-static long writeback_sb_inodes(struct super_block *sb,
+long writeback_sb_inodes(struct super_block *sb,
 				struct bdi_writeback *wb,
 				struct wb_writeback_work *work)
 {
@@ -2132,8 +2117,9 @@ static long writeback_sb_inodes(struct super_block *sb,
 	}
 	return total_wrote;
 }
+EXPORT_SYMBOL_GPL(writeback_sb_inodes);	/* DeLFS dflush */
 
-static long __writeback_inodes_wb(struct bdi_writeback *wb,
+long __writeback_inodes_wb(struct bdi_writeback *wb,
 				  struct wb_writeback_work *work)
 {
 	unsigned long start_time = jiffies;
@@ -2166,6 +2152,7 @@ static long __writeback_inodes_wb(struct bdi_writeback *wb,
 	/* Leave any unwritten inodes on b_io */
 	return wrote;
 }
+EXPORT_SYMBOL_GPL(__writeback_inodes_wb);	/* DeLFS dflush */
 
 static long writeback_inodes_wb(struct bdi_writeback *wb, long nr_pages,
 				enum wb_reason reason)
@@ -2181,7 +2168,7 @@ static long writeback_inodes_wb(struct bdi_writeback *wb, long nr_pages,
 	blk_start_plug(&plug);
 	spin_lock(&wb->list_lock);
 	if (list_empty(&wb->b_io))
-		queue_io(wb, &work, jiffies);
+		wb_queue_io(wb, &work, jiffies);
 	__writeback_inodes_wb(wb, &work);
 	spin_unlock(&wb->list_lock);
 	blk_finish_plug(&plug);
@@ -2257,7 +2244,7 @@ static long wb_writeback(struct bdi_writeback *wb,
 			} else if (work->for_background)
 				dirtied_before = jiffies;
 
-			queue_io(wb, work, dirtied_before);
+			wb_queue_io(wb, work, dirtied_before);
 			queued = true;
 		}
 		if (work->sb)

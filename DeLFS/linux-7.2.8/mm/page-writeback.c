@@ -108,6 +108,7 @@ EXPORT_SYMBOL_GPL(dirty_writeback_interval);
  * The longest time for which data is allowed to remain dirty
  */
 unsigned int dirty_expire_interval = 30 * 100; /* centiseconds */
+EXPORT_SYMBOL_GPL(dirty_expire_interval);	/* DeLFS dflush */
 
 /* End of sysctl-exported parameters */
 
@@ -2165,6 +2166,7 @@ bool wb_over_bg_thresh(struct bdi_writeback *wb)
 
 	return false;
 }
+EXPORT_SYMBOL_GPL(wb_over_bg_thresh);	/* DeLFS dflush */
 
 #ifdef CONFIG_SYSCTL
 /*

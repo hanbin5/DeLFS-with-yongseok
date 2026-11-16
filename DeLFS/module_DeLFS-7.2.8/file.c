@@ -33,6 +33,7 @@
 #include "acl.h"
 #include "gc.h"
 #include "iostat.h"
+#include "dflush.h"
 #include <trace/events/f2fs.h>
 #include <uapi/linux/f2fs.h>
 
@@ -5182,7 +5183,12 @@ static ssize_t f2fs_buffered_write_iter(struct kiocb *iocb,
 	if (iocb->ki_flags & IOCB_NOWAIT)
 		return -EOPNOTSUPP;
 
-	ret = generic_perform_write(iocb, from);
+	/*
+	 * DeLFS dflush: dirty balancing in this copy never sleeps, because
+	 * inode->i_rwsem is held here.  Writeback runs later in
+	 * f2fs_file_write_iter() after inode_unlock().
+	 */
+	ret = df_generic_perform_write(iocb, from);
 
 	if (ret > 0) {
 		f2fs_update_iostat(F2FS_I_SB(inode), inode,
@@ -5456,6 +5462,18 @@ static ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	clear_inode_flag(inode, FI_PREALLOCATED_ALL);
 out_unlock:
 	inode_unlock(inode);
+
+	/*
+	 * DeLFS dflush: the write above only checked the dirty limits.  Now
+	 * that inode->i_rwsem is released, this thread writes back up to 64MB
+	 * itself if the wb is over the background threshold.
+	 *
+	 * Runs for any successful write: pure DIO normally leaves no dirty
+	 * pages, but this also covers DIO falling back to buffered write.
+	 * Skipped for IOCB_NOWAIT, which must not block.
+	 */
+	if (ret > 0 && !(iocb->ki_flags & IOCB_NOWAIT))
+		df_flush_deferred_writeback(inode->i_mapping);
 out:
 	trace_f2fs_file_write_iter(inode, orig_pos, orig_count, ret);
 

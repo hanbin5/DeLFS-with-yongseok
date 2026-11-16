@@ -4368,11 +4368,11 @@ skip_new_segment:
 		/* DeLFS: remember the core whose cursegs served this IO */
 		fio->cpu = cpu;
 		/*
-		 * TODO(A): DeLFS queues the fio on the per-core write_io
-		 * (sbi->wrap_write_io of @cpu) and only for REQ_OP_WRITE fios;
-		 * write_io is owned by another part, so it is kept global here.
+		 * DeLFS per-core bio: queue on fio->cpu's io_list.  The
+		 * allocator (A part) sets fio->cpu just above this line.
 		 */
-		io = sbi->write_io[fio->type] + fio->temp;
+		io = per_cpu_ptr(sbi->wrap_write_io, fio->cpu)->write_io[fio->type] +
+								fio->temp;
 		spin_lock(&io->io_lock);
 		list_add_tail(&fio->list, &io->io_list);
 		spin_unlock(&io->io_lock);
