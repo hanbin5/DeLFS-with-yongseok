@@ -821,8 +821,15 @@ struct extent_tree {
 struct extent_tree_info {
 	struct radix_tree_root extent_tree_root;/* cache extent cache entries */
 	struct mutex extent_tree_lock;	/* locking extent radix tree */
-	struct list_head extent_list;		/* lru list for shrinker */
-	spinlock_t extent_lock;			/* locking extent lru list */
+//	struct list_head extent_list;		/* lru list for shrinker */
+//	spinlock_t extent_lock;			/* locking extent lru list */
+	struct list_head __percpu *p_extent_list;		/* lru list for shrinker */
+	spinlock_t __percpu *p_extent_lock;			/* locking extent lru list */
+
+	int nr_extent_buckets;
+
+	atomic_t rr_cpu;
+
 	atomic_t total_ext_tree;		/* extent tree count */
 	struct list_head zombie_list;		/* extent zombie tree list */
 	atomic_t total_zombie_tree;		/* extent zombie tree count */
@@ -1079,7 +1086,8 @@ enum nat_state {
 struct f2fs_nm_info {
 	block_t nat_blkaddr;		/* base disk address of NAT */
 	nid_t max_nid;			/* maximum possible node ids */
-	nid_t available_nids;		/* # of available node ids */
+	//nid_t available_nids;		/* # of available node ids */
+	atomic_t available_nids;		/* # of available node ids */
 	nid_t next_scan_nid;		/* the next nid to be scanned */
 	nid_t max_rf_node_blocks;	/* max # of nodes for recovery */
 	unsigned int ram_thresh;	/* control the memory footprint */
@@ -1087,23 +1095,39 @@ struct f2fs_nm_info {
 	unsigned int dirty_nats_ratio;	/* control dirty nats ratio threshold */
 
 	/* NAT cache management */
-	struct radix_tree_root nat_root;/* root of the nat entry cache */
-	struct radix_tree_root nat_set_root;/* root of the nat set cache */
-	struct f2fs_rwsem nat_tree_lock;	/* protect nat entry tree */
-	struct list_head nat_entries;	/* cached nat entry list (clean) */
-	spinlock_t nat_list_lock;	/* protect clean nat entry list */
-	unsigned int nat_cnt[MAX_NAT_STATE]; /* the # of cached nat entries */
+//	struct radix_tree_root nat_root;/* root of the nat entry cache */
+//	struct radix_tree_root nat_set_root;/* root of the nat set cache */
+//	struct f2fs_rwsem nat_tree_lock;	/* protect nat entry tree */
+//	struct list_head nat_entries;	/* cached nat entry list (clean) */
+//	spinlock_t nat_list_lock;	/* protect clean nat entry list */
+//	unsigned int nat_cnt[MAX_NAT_STATE]; /* the # of cached nat entries */
 	unsigned int nat_blocks;	/* # of nat blocks */
 
+	struct radix_tree_root __percpu *p_nat_root;/* root of the nat entry cache */
+	struct radix_tree_root __percpu *p_nat_set_root;/* root of the nat set cache */
+	struct radix_tree_root __percpu *p_free_nid_root;/* root of the free_nid cache */
+	struct f2fs_rwsem __percpu *p_nat_tree_lock;	/* protect nat entry tree */
+
+	struct list_head __percpu *p_nat_entries;	/* cached nat entry list (clean) */
+	spinlock_t __percpu *p_nat_list_lock;	/* protect clean nat entry list */
+
+	struct list_head __percpu *p_free_nid_list;		/* list for free nids excluding preallocated nids */
+	spinlock_t __percpu *p_nid_list_lock;	/* protect nid lists ops */
+
+	atomic_t nid_cnt[MAX_NID_STATE];	/* the number of free node id */
+	atomic_t nat_cnt[MAX_NAT_STATE]; /* the # of cached nat entries */
+
+	atomic_t *free_nid_count;	/* free nid count of NAT block */
+
 	/* free node ids management */
-	struct radix_tree_root free_nid_root;/* root of the free_nid cache */
-	struct list_head free_nid_list;		/* list for free nids excluding preallocated nids */
-	unsigned int nid_cnt[MAX_NID_STATE];	/* the number of free node id */
-	spinlock_t nid_list_lock;	/* protect nid lists ops */
+//	struct radix_tree_root free_nid_root;/* root of the free_nid cache */
+//	struct list_head free_nid_list;		/* list for free nids excluding preallocated nids */
+//	unsigned int nid_cnt[MAX_NID_STATE];	/* the number of free node id */
+//	spinlock_t nid_list_lock;	/* protect nid lists ops */
 	struct mutex build_lock;	/* lock for build free nids */
 	unsigned char **free_nid_bitmap;
 	unsigned char *nat_block_bitmap;
-	unsigned short *free_nid_count;	/* free nid count of NAT block */
+//	unsigned short *free_nid_count;	/* free nid count of NAT block */
 
 	/* for checkpoint */
 	char *nat_bitmap;		/* NAT bitmap pointer */
@@ -3892,7 +3916,8 @@ bool f2fs_inode_chksum_verify(struct f2fs_sb_info *sbi, struct folio *folio);
 void f2fs_inode_chksum_set(struct f2fs_sb_info *sbi, struct folio *folio);
 struct inode *f2fs_iget(struct super_block *sb, unsigned long ino);
 struct inode *f2fs_iget_retry(struct super_block *sb, unsigned long ino);
-int f2fs_try_to_free_nats(struct f2fs_sb_info *sbi, int nr_shrink);
+//int f2fs_try_to_free_nats(struct f2fs_sb_info *sbi, int nr_shrink);
+int f2fs_try_to_free_nats(struct f2fs_sb_info *sbi, int nr_shrink, int nat_cpu);
 void f2fs_update_inode(struct inode *inode, struct folio *node_folio);
 void f2fs_update_inode_page(struct inode *inode);
 int f2fs_write_inode(struct inode *inode, struct writeback_control *wbc);

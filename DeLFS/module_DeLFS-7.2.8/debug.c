@@ -232,13 +232,18 @@ static void update_general_status(struct f2fs_sb_info *sbi)
 		si->compress_page_hit = atomic_read(&sbi->compress_page_hit);
 	}
 #endif
-	si->nats = NM_I(sbi)->nat_cnt[TOTAL_NAT];
-	si->dirty_nats = NM_I(sbi)->nat_cnt[DIRTY_NAT];
+	//si->nats = NM_I(sbi)->nat_cnt[TOTAL_NAT];
+	si->nats = atomic_read(&NM_I(sbi)->nat_cnt[TOTAL_NAT]);
+	//si->dirty_nats = NM_I(sbi)->nat_cnt[DIRTY_NAT];
+	si->dirty_nats = atomic_read(&NM_I(sbi)->nat_cnt[DIRTY_NAT]);
 	si->sits = MAIN_SEGS(sbi);
 	si->dirty_sits = atomic_read(&SIT_I(sbi)->dirty_sentries);	/* DeLFS (B): atomic */
-	si->free_nids = NM_I(sbi)->nid_cnt[FREE_NID];
-	si->avail_nids = NM_I(sbi)->available_nids;
-	si->alloc_nids = NM_I(sbi)->nid_cnt[PREALLOC_NID];
+	//si->free_nids = NM_I(sbi)->nid_cnt[FREE_NID];
+	si->free_nids = atomic_read(&NM_I(sbi)->nid_cnt[FREE_NID]);
+	//si->avail_nids = NM_I(sbi)->available_nids;
+	si->avail_nids = atomic_read(&NM_I(sbi)->available_nids);
+	//si->alloc_nids = NM_I(sbi)->nid_cnt[PREALLOC_NID];
+	si->alloc_nids = atomic_read(&NM_I(sbi)->nid_cnt[PREALLOC_NID]);
 	si->io_skip_bggc = sbi->io_skip_bggc;
 	si->other_skip_bggc = sbi->other_skip_bggc;
 	si->util_free = (int)(BLKS_TO_SEGS(sbi, free_user_blocks(sbi)))
@@ -362,13 +367,21 @@ get_cache:
 	}
 
 	/* free nids */
-	si->cache_mem += (NM_I(sbi)->nid_cnt[FREE_NID] +
-				NM_I(sbi)->nid_cnt[PREALLOC_NID]) *
+	si->cache_mem += (atomic_read(&NM_I(sbi)->nid_cnt[FREE_NID]) +
+				atomic_read(&NM_I(sbi)->nid_cnt[PREALLOC_NID])) *
 				sizeof(struct free_nid);
-	si->cache_mem += NM_I(sbi)->nat_cnt[TOTAL_NAT] *
+	si->cache_mem += atomic_read(&NM_I(sbi)->nat_cnt[TOTAL_NAT]) *
 				sizeof(struct nat_entry);
-	si->cache_mem += NM_I(sbi)->nat_cnt[DIRTY_NAT] *
+	si->cache_mem += atomic_read(&NM_I(sbi)->nat_cnt[DIRTY_NAT]) *
 				sizeof(struct nat_entry_set);
+
+//	si->cache_mem += (NM_I(sbi)->nid_cnt[FREE_NID] +
+//				NM_I(sbi)->nid_cnt[PREALLOC_NID]) *
+//				sizeof(struct free_nid);
+//	si->cache_mem += NM_I(sbi)->nat_cnt[TOTAL_NAT] *
+//				sizeof(struct nat_entry);
+//	si->cache_mem += NM_I(sbi)->nat_cnt[DIRTY_NAT] *
+//				sizeof(struct nat_entry_set);
 	for (i = 0; i < MAX_INO_ENTRY; i++)
 		si->cache_mem += sbi->im[i].ino_num * sizeof(struct ino_entry);
 

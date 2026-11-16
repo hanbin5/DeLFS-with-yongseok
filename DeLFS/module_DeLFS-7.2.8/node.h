@@ -79,6 +79,8 @@ struct nat_entry {
 
 #define inc_node_version(version)	(++(version))
 
+int nid_to_nat_cpu(nid_t n);
+
 static inline void copy_node_info(struct node_info *dst,
 						struct node_info *src)
 {
@@ -130,7 +132,8 @@ static inline void raw_nat_from_node_info(struct f2fs_nat_entry *raw_ne,
 static inline bool excess_dirty_nats(struct f2fs_sb_info *sbi)
 {
 	/* nat_cnt[] is heuristic accounting sampled locklessly here. */
-	return data_race(READ_ONCE(NM_I(sbi)->nat_cnt[DIRTY_NAT])) >=
+	//return data_race(READ_ONCE(NM_I(sbi)->nat_cnt[DIRTY_NAT])) >=
+	return atomic_read(&NM_I(sbi)->nat_cnt[DIRTY_NAT]) >=
 					NM_I(sbi)->max_nid *
 					NM_I(sbi)->dirty_nats_ratio / 100;
 }
@@ -138,7 +141,8 @@ static inline bool excess_dirty_nats(struct f2fs_sb_info *sbi)
 static inline bool excess_cached_nats(struct f2fs_sb_info *sbi)
 {
 	/* nat_cnt[] is heuristic accounting sampled locklessly here. */
-	return data_race(READ_ONCE(NM_I(sbi)->nat_cnt[TOTAL_NAT])) >=
+	//return data_race(READ_ONCE(NM_I(sbi)->nat_cnt[TOTAL_NAT])) >=
+	return atomic_read(&NM_I(sbi)->nat_cnt[TOTAL_NAT]) >=
 					DEF_NAT_CACHE_THRESHOLD;
 }
 
@@ -172,14 +176,23 @@ static inline void next_free_nid(struct f2fs_sb_info *sbi, nid_t *nid)
 	struct f2fs_nm_info *nm_i = NM_I(sbi);
 	struct free_nid *fnid;
 
-	spin_lock(&nm_i->nid_list_lock);
-	if (nm_i->nid_cnt[FREE_NID] <= 0) {
-		spin_unlock(&nm_i->nid_list_lock);
+	int nat_cpu = nid_to_nat_cpu(*nid);
+	struct list_head *p_free_nid_list = per_cpu_ptr(nm_i->p_free_nid_list, nat_cpu);
+	spinlock_t *p_nid_list_lock = per_cpu_ptr(nm_i->p_nid_list_lock, nat_cpu);
+
+	//spin_lock(&nm_i->nid_list_lock);
+	spin_lock(p_nid_list_lock);
+	//if (nm_i->nid_cnt[FREE_NID] <= 0) { //}
+	if (atomic_read(&nm_i->nid_cnt[FREE_NID]) <= 0) {
+		//spin_unlock(&nm_i->nid_list_lock);
+		spin_unlock(p_nid_list_lock);
 		return;
 	}
-	fnid = list_first_entry(&nm_i->free_nid_list, struct free_nid, list);
+	//fnid = list_first_entry(&nm_i->free_nid_list, struct free_nid, list);
+	fnid = list_first_entry(p_free_nid_list, struct free_nid, list);
 	*nid = fnid->nid;
-	spin_unlock(&nm_i->nid_list_lock);
+	//spin_unlock(&nm_i->nid_list_lock);
+	spin_unlock(p_nid_list_lock);
 }
 
 /*
