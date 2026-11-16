@@ -6,6 +6,7 @@ This repository contains the DeLFS source code, comparison file systems, formatt
 
 - [Repository structure](#repository-structure)
 - [Team VM environment guide](env-guide/README.md)
+- [Linux 7.2.8 Quick Start](#linux-728-quick-start)
 - [Build and install DeLFS](#build-and-install-delfs)
 - [Run the benchmarks](#run-the-benchmarks)
 
@@ -15,7 +16,9 @@ This repository contains the DeLFS source code, comparison file systems, formatt
 DeLFS/
 ├── DeLFS/
 │   ├── linux-6.6.8/
-│   └── module_DeLFS/
+│   ├── linux-7.2.8/
+│   ├── module_DeLFS/
+│   └── module_DeLFS-7.2.8/
 ├── DeLFS-CrashMonkey/
 ├── DeLFS-Git-Aging-Benchmark/
 ├── delfs-mkfs/
@@ -45,6 +48,48 @@ Each configuration under `F2FSJ/` contains `linux-6.6.8/` and `module_f3fsj/`. E
 The commands below start from the repository root unless stated otherwise.
 
 For the team's development and test VM setup, including the scaled benchmarks for a 20 GB nvme-loop device, follow the [environment guide](env-guide/README.md). It uses the profiles and workloads in `script/` with the runners in `env-guide/scripts/`.
+
+## Linux 7.2.8 Quick Start
+
+1. **Build and install the patched 7.2.8 kernel** (then reboot into `7.2.8-delfs`):
+
+```bash
+cd DeLFS/linux-7.2.8
+cp ../linux-6.6.8/oldconfig .config   # or /boot/config-$(uname -r)
+scripts/config --set-str LOCALVERSION -delfs \
+    --set-str SYSTEM_TRUSTED_KEYS "" --set-str SYSTEM_REVOCATION_KEYS "" \
+    --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT --disable DEBUG_INFO_DWARF4 \
+    --disable DEBUG_INFO_DWARF5 --disable DEBUG_INFO_BTF --enable DEBUG_INFO_NONE
+make olddefconfig
+make -j "$(nproc)" && make -j "$(nproc)" modules
+sudo make -j "$(nproc)" modules_install INSTALL_MOD_STRIP=1
+sudo make -j "$(nproc)" install
+cd ../..
+```
+
+2. **Build `mkfs.delfs` and format the target NVMe device** (run on the target machine so `mkfs.delfs` matches online CPU count):
+
+```bash
+cd delfs-mkfs && ./autogen.sh && ./configure && make -j "$(nproc)" && cd ..
+cd DeLFS && ./mkfs.sh nvme0n1 && cd ..
+```
+
+3. **Build, load, and mount the 7.2.8 DeLFS module**:
+
+```bash
+cd DeLFS/module_DeLFS-7.2.8
+make -j "$(nproc)"                    # add CALCLOCK=1 to enable calclock profiling
+
+sudo rmmod f2fs 2>/dev/null || true
+sudo modprobe -v lz4_compress lz4hc_compress jbd2
+sudo insmod delfs.ko
+
+sudo mkdir -p /mnt/test
+sudo mount -t delfs /dev/nvme0n1 /mnt/test
+cd ../..
+```
+
+Then run the benchmarks in [`script/`](#run-the-benchmarks) (or the 20 GB `nvme-loop` test scripts in [`env-guide/`](env-guide/README.md)).
 
 ## Build and install DeLFS
 
