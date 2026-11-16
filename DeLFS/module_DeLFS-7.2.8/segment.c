@@ -4359,29 +4359,6 @@ skip_new_segment:
 		f2fs_inode_chksum_set(sbi, folio);
 	}
 
-	/*
-	 * DeLFS (B): GC's move_data_block() passes its READ fio only to mark
-	 * the write as GC (fio->io_type); it submits the block by itself, so
-	 * only WRITE fios are queued.
-	 */
-	if (fio && fio->op == REQ_OP_WRITE) {
-		struct f2fs_bio_info *io;
-
-		INIT_LIST_HEAD(&fio->list);
-		fio->in_list = 1;
-		/* DeLFS: remember the core whose cursegs served this IO */
-		fio->cpu = cpu;
-		/*
-		 * DeLFS per-core bio: queue on fio->cpu's io_list.  The
-		 * allocator (A part) sets fio->cpu just above this line.
-		 */
-		io = per_cpu_ptr(sbi->wrap_write_io, fio->cpu)->write_io[fio->type] +
-								fio->temp;
-		spin_lock(&io->io_lock);
-		list_add_tail(&fio->list, &io->io_list);
-		spin_unlock(&io->io_lock);
-	}
-
 	mutex_unlock(&curseg->curseg_mutex);
 
 	/*
@@ -4412,6 +4389,35 @@ skip_new_segment:
 							 sentry_cpu_old);
 		else
 			oldinv_enqueue(sbi, old_blkaddr);
+	}
+
+	/*
+	 * DeLFS (B): queue the fio only now, after its new block is set in
+	 * SIT and the old block is invalidated (or handed to deLLC), as the
+	 * DeLFS original does. f2fs_submit_page_write() of any thread may
+	 * take it from io_list at once, and verify_fio_blkaddr() then checks
+	 * the new block's SIT bit (DATA_GENERIC_ENHANCE).
+	 *
+	 * GC's move_data_block() passes its READ fio only to mark the write
+	 * as GC (fio->io_type); it submits the block by itself, so only WRITE
+	 * fios are queued.
+	 */
+	if (fio && fio->op == REQ_OP_WRITE) {
+		struct f2fs_bio_info *io;
+
+		INIT_LIST_HEAD(&fio->list);
+		fio->in_list = 1;
+		/* DeLFS: remember the core whose cursegs served this IO */
+		fio->cpu = cpu;
+		/*
+		 * DeLFS per-core bio: queue on fio->cpu's io_list.  The
+		 * allocator (A part) sets fio->cpu just above this line.
+		 */
+		io = per_cpu_ptr(sbi->wrap_write_io, fio->cpu)->write_io[fio->type] +
+								fio->temp;
+		spin_lock(&io->io_lock);
+		list_add_tail(&fio->list, &io->io_list);
+		spin_unlock(&io->io_lock);
 	}
 
 	f2fs_up_read(&SM_I(sbi)->curseg_lock);
