@@ -26,6 +26,18 @@
 #include "iostat.h"
 #include "oldinv.h"	/* DeLFS deLLC (B) */
 #include <trace/events/f2fs.h>
+#include "calc/calclock.h"
+KTDEF(submit_bio);
+KTDEF(curseg_lock__allocate_data_block);
+KTDEF(sentry_lock);
+KTDEF(if_1);
+KTDEF(if_2);
+KTDEF(if_3);
+KTDEF(if_4);
+KTDEF(if_5);
+KTDEF(if_6);
+KTDEF(if_7);
+KTDEF(locate_dirty_segment);
 
 #define __reverse_ffz(x) __reverse_ffs(~(x))
 
@@ -524,12 +536,16 @@ int f2fs_commit_atomic_write(struct inode *inode)
 	return err;
 }
 
+KTDEF(has_enough_free_secs);
+KTDEF(gc_lock);
+
 /*
  * This function balances dirty node and dentry pages.
  * In addition, it controls garbage collection.
  */
-void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
+static void f2fs_balance_fs_internal(struct f2fs_sb_info *sbi, bool need)
 {
+	ktime_t stopwatch[2];
 	if (f2fs_cp_error(sbi))
 		return;
 
@@ -547,9 +563,14 @@ void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
 	 * We should do GC or end up with checkpoint, if there are so many dirty
 	 * dir/node pages without enough free segments.
 	 */
+	ktget(&stopwatch[0]);
 	if (has_enough_free_secs(sbi, 0, 0)) {
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, has_enough_free_secs);
 		return;
 	}
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, has_enough_free_secs);
 
 	/*
 	 * We are entering critical free-space path.
@@ -565,9 +586,14 @@ void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
 		 * sections immediately, but it can turn segments into PRE.
 		 * Recheck anyway; if enough space became visible, skip GC.
 		 */
+		ktget(&stopwatch[0]);
 		if (has_enough_free_secs(sbi, 0, 0)) {
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, has_enough_free_secs);
 			return;
 		}
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, has_enough_free_secs);
 	}
 
 	/*
@@ -596,11 +622,25 @@ void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
 			.nr_free_secs = 1,
 		};
 
+		ktget(&stopwatch[0]);
 		/* f2fs_down_write(&sbi->gc_lock); */
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, gc_lock);
 
 		stat_inc_gc_call_count(sbi, FOREGROUND);
 		f2fs_gc(sbi, &gc_control, smp_processor_id());
 	}
+}
+
+KTDEF(f3fs_balance_fs);
+
+void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
+{
+	ktime_t stopwatch[2];
+	ktget(&stopwatch[0]);
+	f2fs_balance_fs_internal(sbi, need);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_balance_fs);
 }
 
 static inline bool excess_dirty_threshold(struct f2fs_sb_info *sbi)
@@ -622,8 +662,12 @@ static inline bool excess_dirty_threshold(struct f2fs_sb_info *sbi)
 	return dents + qdata + nodes + meta + imeta >  global_threshold;
 }
 
+KTDEF(mutex_lock_flush_lock);
+KTDEF(f3fs_sync_dirty_inodes);
+
 void f2fs_balance_fs_bg(struct f2fs_sb_info *sbi, bool from_bg)
 {
+	ktime_t stopwatch[2];
 	int nat_cpu;
 
 	if (unlikely(is_sbi_flag_set(sbi, SBI_POR_DOING)))
@@ -672,10 +716,16 @@ do_sync:
 	if (test_opt(sbi, DATA_FLUSH) && from_bg) {
 		struct blk_plug plug;
 
+		ktget(&stopwatch[0]);
 		mutex_lock(&sbi->flush_lock);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, mutex_lock_flush_lock);
 
 		blk_start_plug(&plug);
+		ktget(&stopwatch[0]);
 		f2fs_sync_dirty_inodes(sbi, FILE_INODE, false);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_sync_dirty_inodes);
 		blk_finish_plug(&plug);
 
 		mutex_unlock(&sbi->flush_lock);
@@ -1043,6 +1093,11 @@ void f2fs_remove_dirty_segment_locked(struct f2fs_sb_info *sbi,
 {
 	__remove_dirty_segment(sbi, segno, dirty_type);
 }
+
+KTDEF(locate_1);
+KTDEF(dirty_seglist_lock);
+KTDEF(get_valid_blocks);
+KTDEF(__x_dirty_segment);
 
 /*
  * Should not occur error such as -ENOMEM.
@@ -1464,6 +1519,7 @@ static int __submit_discard_cmd(struct f2fs_sb_info *sbi,
 				struct discard_policy *dpolicy,
 				struct discard_cmd *dc, int *issued)
 {
+	ktime_t stopwatch[2];
 	struct block_device *bdev = dc->bdev;
 	unsigned int max_discard_blocks =
 			SECTOR_TO_BLOCK(bdev_max_discard_sectors(bdev));
@@ -1550,7 +1606,10 @@ static int __submit_discard_cmd(struct f2fs_sb_info *sbi,
 		bio->bi_private = dc;
 		bio->bi_end_io = f2fs_submit_discard_endio;
 		bio->bi_opf |= flag;
+		ktget(&stopwatch[0]);
 		submit_bio(bio);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, submit_bio);
 
 
 		atomic_inc(&dcc->issued_discard);
@@ -2830,9 +2889,13 @@ void update_sit_entry(struct f2fs_sb_info *sbi, block_t blkaddr, int del)
 		get_sec_entry(sbi, segno)->valid_blocks += del;
 }
 
+KTDEC(sentry_lock);
+KTDEC(locate_dirty_segment);
+
 void f2fs_invalidate_blocks(struct f2fs_sb_info *sbi, block_t addr,
 				unsigned int len)
 {
+	ktime_t stopwatch[2];
 	unsigned int segno = GET_SEGNO(sbi, addr);
 	struct sit_info *sit_i = SIT_I(sbi);
 	block_t addr_start = addr, addr_end = addr + len - 1;
@@ -2863,13 +2926,19 @@ void f2fs_invalidate_blocks(struct f2fs_sb_info *sbi, block_t addr,
 					segno_to_sentry_cpu(sbi, segno));
 
 		/* add it into sit main buffer */
+		ktget(&stopwatch[0]);
 		down_write(se_lock);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, sentry_lock);
 
 		update_segment_mtime(sbi, addr_start, 0);
 		update_sit_entry(sbi, addr_start, -cnt);
 
 		/* add it into dirty seglist */
+		ktget(&stopwatch[0]);
 		locate_dirty_segment(sbi, segno);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, locate_dirty_segment);
 
 		up_write(se_lock);
 
@@ -4252,6 +4321,7 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct folio *folio,
 		struct f2fs_summary *sum, int type,
 		struct f2fs_io_info *fio)
 {
+	ktime_t stopwatch[2];
 	struct sit_info *sit_i = SIT_I(sbi);
 	/*
 	 * DeLFS: allocate from the cursegs of the core we run on. The task may
@@ -4272,7 +4342,10 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct folio *folio,
 	struct rw_semaphore *se_lock;
 	int ret = 0;
 
+	ktget(&stopwatch[0]);
 	f2fs_down_read(&SM_I(sbi)->curseg_lock);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, if_2);
 
 	/*
 	 * DeLFS (B) DDL: no SIT lock while the curseg moves on. The SIT
@@ -4280,7 +4353,10 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct folio *folio,
 	 * SIT lock of the core that owns the segment, one lock at a time
 	 * (curseg_lock(read) -> curseg_mutex -> unlock -> owner SIT lock).
 	 */
+	ktget(&stopwatch[0]);
 	mutex_lock(&curseg->curseg_mutex);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, curseg_lock__allocate_data_block);
 
 	if (curseg->segno == NULL_SEGNO) {
 		ret = -ENOSPC;
@@ -4291,6 +4367,7 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct folio *folio,
 	 * DeLFS (B): GC data migration keeps the source segment's mtime, and
 	 * its old block must be invalidated before FG_GC checks the victim.
 	 */
+	ktget(&stopwatch[0]);
 	if (gc_data_write) {
 		f2fs_bug_on(sbi, GET_SEGNO(sbi, old_blkaddr) == NULL_SEGNO);
 		se = get_seg_entry(sbi, GET_SEGNO(sbi, old_blkaddr));
@@ -4298,11 +4375,16 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct folio *folio,
 		f2fs_bug_on(sbi, IS_NODESEG(se->type));
 		old_mtime = get_segment_mtime(sbi, old_blkaddr);
 	}
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, if_3);
 	*new_blkaddr = NEXT_FREE_BLKADDR(sbi, curseg);
 
 	f2fs_bug_on(sbi, curseg->next_blkoff >= BLKS_PER_SEG(sbi));
 
+	ktget(&stopwatch[0]);
 	f2fs_wait_discard_bio(sbi, *new_blkaddr);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, if_4);
 
 	sum_entries(curseg->sum_blk)[curseg->next_blkoff] = *sum;
 	if (curseg->alloc_type == SSR) {
@@ -4320,12 +4402,15 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct folio *folio,
 	 * If the current segment is full, flush it out and replace it with a
 	 * new segment.
 	 */
+	ktget(&stopwatch[0]);
 	if (segment_full) {
 		if (type == CURSEG_COLD_DATA_PINNED &&
 		    !((curseg->segno + 1) % sbi->segs_per_sec)) {
 			write_sum_page(sbi, curseg->sum_blk, curseg->segno);
 			/* DeLFS: drop the curseg ref as well */
 			release_curseg(sbi, curseg);
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, if_1);
 			goto skip_new_segment;
 		}
 
@@ -4340,9 +4425,14 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct folio *folio,
 			stat_inc_seg_type(sbi, curseg);
 		}
 
-		if (ret)
+		if (ret) {
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, if_1);
 			goto out_err;
+		}
 	}
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, if_1);
 
 skip_new_segment:
 	if (IS_DATASEG(curseg->seg_type)) {
@@ -4353,11 +4443,14 @@ skip_new_segment:
 			atomic64_set(&sbi->allocated_data_blocks, 0);
 	}
 
+	ktget(&stopwatch[0]);
 	if (folio && IS_NODESEG(curseg->seg_type)) {
 		fill_node_footer_blkaddr(folio, NEXT_FREE_BLKADDR(sbi, curseg));
 
 		f2fs_inode_chksum_set(sbi, folio);
 	}
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, if_6);
 
 	/*
 	 * DeLFS (B): GC's move_data_block() passes its READ fio only to mark
@@ -4377,7 +4470,11 @@ skip_new_segment:
 		 */
 		io = per_cpu_ptr(sbi->wrap_write_io, fio->cpu)->write_io[fio->type] +
 								fio->temp;
+		ktget(&stopwatch[0]);
 		spin_lock(&io->io_lock);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, if_7);
+
 		list_add_tail(&fio->list, &io->io_list);
 		spin_unlock(&io->io_lock);
 	}
@@ -4398,7 +4495,10 @@ skip_new_segment:
 	sentry_cpu_new = segno_to_sentry_cpu(sbi, new_segno);
 
 	se_lock = per_cpu_ptr(sit_i->percore_sentry_lock, sentry_cpu_new);
+	ktget(&stopwatch[0]);
 	down_write(se_lock);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, sentry_lock);
 	update_segment_mtime(sbi, *new_blkaddr, old_mtime);
 	update_sit_entry(sbi, *new_blkaddr, 1);
 	locate_dirty_segment(sbi, new_segno);
@@ -4474,8 +4574,12 @@ static int log_type_to_seg_type(enum log_type type)
 	return seg_type;
 }
 
+KTDEF(f3fs_allocate_data_block);
+KTDEF(f3fs_submit_page_write);
+
 static void do_write_page(struct f2fs_summary *sum, struct f2fs_io_info *fio)
 {
+	ktime_t stopwatch[2];
 	struct folio *folio = fio->folio;
 	enum log_type type = __get_segment_type(fio);
 	int seg_type = log_type_to_seg_type(type);
@@ -4486,8 +4590,11 @@ static void do_write_page(struct f2fs_summary *sum, struct f2fs_io_info *fio)
 	if (keep_order)
 		f2fs_down_read(&fio->sbi->io_order_lock);
 
+	ktget(&stopwatch[0]);
 	err = f2fs_allocate_data_block(fio->sbi, folio, fio->old_blkaddr,
 			&fio->new_blkaddr, sum, type, fio);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_allocate_data_block);
 	if (unlikely(err)) {
 		f2fs_err_ratelimited(fio->sbi,
 			"%s Failed to allocate data block, ino:%u, index:%lu, type:%d, old_blkaddr:0x%x, new_blkaddr:0x%x, err:%d",
@@ -4510,7 +4617,10 @@ static void do_write_page(struct f2fs_summary *sum, struct f2fs_io_info *fio)
 		f2fs_invalidate_internal_cache(fio->sbi, fio->old_blkaddr, 1);
 
 	/* writeout dirty page into bdev */
+	ktget(&stopwatch[0]);
 	f2fs_submit_page_write(fio);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_submit_page_write);
 
 	f2fs_update_device_state(fio->sbi, fio->ino, fio->new_blkaddr, 1);
 out:

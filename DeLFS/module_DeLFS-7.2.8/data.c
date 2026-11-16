@@ -28,6 +28,7 @@
 #include "segment.h"
 #include "iostat.h"
 #include <trace/events/f2fs.h>
+#include "calc/calclock.h"
 
 #define NUM_PREALLOC_POST_READ_CTXS	128
 
@@ -562,9 +563,12 @@ static bool f2fs_crypt_mergeable_bio(struct bio *bio, const struct inode *inode,
 			(loff_t)next_idx << inode->i_blkbits);
 }
 
+KTDEF(submit_read_bio);
+
 void f2fs_submit_read_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 				 enum page_type type)
 {
+	ktime_t stopwatch[2];
 	if (!bio)
 		return;
 
@@ -572,16 +576,25 @@ void f2fs_submit_read_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 	trace_f2fs_submit_read_bio(sbi->sb, type, bio);
 
 	iostat_update_submit_ctx(bio, type);
+	ktget(&stopwatch[0]);
 	blk_crypto_submit_bio(bio);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, submit_read_bio);
 }
+
+KTDEF(submit_write_bio);
 
 static void f2fs_submit_write_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 				  enum page_type type)
 {
+	ktime_t stopwatch[2];
 	WARN_ON_ONCE(is_read_io(bio_op(bio)));
 	trace_f2fs_submit_write_bio(sbi->sb, type, bio);
 	iostat_update_submit_ctx(bio, type);
+	ktget(&stopwatch[0]);
 	blk_crypto_submit_bio(bio);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, submit_write_bio);
 }
 
 static void __submit_merged_bio(struct f2fs_bio_info *io)
@@ -1160,8 +1173,18 @@ static bool is_end_zone_blkaddr(struct f2fs_sb_info *sbi, block_t blkaddr)
 }
 #endif
 
+KTDEF(io_rwsem__submit_page_write);
+KTDEF(io_lock);
+KTDEF(__submit_merged_bio);
+KTDEF(__bio_alloc);
+KTDEF(sub_1);
+KTDEF(sub_2);
+KTDEF(sub_3);
+KTDEF(sub_4);
+
 void f2fs_submit_page_write(struct f2fs_io_info *fio)
 {
+	ktime_t stopwatch[2];
 	struct f2fs_sb_info *sbi = fio->sbi;
 	enum page_type btype = PAGE_TYPE_OF_BIO(fio->type);
 	/*
@@ -1178,7 +1201,10 @@ void f2fs_submit_page_write(struct f2fs_io_info *fio)
 
 	f2fs_bug_on(sbi, is_read_io(fio->op));
 
+	ktget(&stopwatch[0]);
 	f2fs_down_write_trace(&io->io_rwsem, &lc);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, io_rwsem__submit_page_write);
 next:
 #ifdef CONFIG_BLK_DEV_ZONED
 	if (f2fs_sb_has_blkzoned(sbi) && btype < META && io->zone_pending_bio) {
@@ -1190,7 +1216,10 @@ next:
 #endif
 
 	if (fio->in_list) {
+		ktget(&stopwatch[0]);
 		spin_lock(&io->io_lock);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, io_lock);
 		if (list_empty(&io->io_list)) {
 			spin_unlock(&io->io_lock);
 			goto out;
@@ -1201,7 +1230,10 @@ next:
 		spin_unlock(&io->io_lock);
 	}
 
+	ktget(&stopwatch[0]);
 	verify_fio_blkaddr(fio);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, sub_1);
 
 	if (fio->encrypted_page)
 		bio_folio = page_folio(fio->encrypted_page);
@@ -1216,28 +1248,50 @@ next:
 	type = WB_DATA_TYPE(bio_folio, fio->compressed_page);
 	inc_page_count(sbi, type);
 
+	ktget(&stopwatch[0]);
 	if (io->bio &&
 	    (!io_is_mergeable(sbi, io->bio, io, fio, io->last_block_in_bio,
 			      fio->new_blkaddr) ||
 	     !f2fs_crypt_mergeable_bio(io->bio, fio_inode(fio),
-				bio_folio->index, fio)))
+				bio_folio->index, fio))) {
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, sub_2);
+
+		ktget(&stopwatch[0]);
 		__submit_merged_bio(io);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, __submit_merged_bio);
+	} else {
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, sub_2);
+	}
+
 alloc_new:
 	if (io->bio == NULL) {
+		ktget(&stopwatch[0]);
 		io->bio = __bio_alloc(fio, BIO_MAX_VECS);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, __bio_alloc);
 		f2fs_set_bio_crypt_ctx(io->bio, fio_inode(fio),
 				bio_folio->index, fio, GFP_NOIO);
 		io->fio = *fio;
 	}
 
 	if (!bio_add_folio(io->bio, bio_folio, folio_size(bio_folio), 0)) {
+		ktget(&stopwatch[0]);
 		__submit_merged_bio(io);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, __submit_merged_bio);
 		goto alloc_new;
 	}
 
-	if (fio->io_wbc)
+	if (fio->io_wbc) {
+		ktget(&stopwatch[0]);
 		wbc_account_cgroup_owner(fio->io_wbc, fio->folio,
 				folio_size(fio->folio));
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, sub_4);
+	}
 
 	io->last_block_in_bio = fio->new_blkaddr;
 
@@ -3108,8 +3162,12 @@ static inline bool need_inplace_update(struct f2fs_io_info *fio)
 	return f2fs_should_update_inplace(inode, fio);
 }
 
-int f2fs_do_write_data_page(struct f2fs_io_info *fio)
+KTDEF(f3fs_outplace_write_data);
+KTDEF(f3fs_get_node_info);
+
+static int f2fs_do_write_data_page_internal(struct f2fs_io_info *fio)
 {
+	ktime_t stopwatch[2];
 	struct folio *folio = fio->folio;
 	struct inode *inode = folio->mapping->host;
 	struct dnode_of_data dn;
@@ -3206,7 +3264,10 @@ got_it:
 		fio->need_lock = LOCK_REQ;
 	}
 
+	ktget(&stopwatch[0]);
 	err = f2fs_get_node_info(fio->sbi, dn.nid, &ni, false);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_get_node_info);
 	if (err)
 		goto out_writepage;
 
@@ -3222,7 +3283,10 @@ got_it:
 		f2fs_i_compr_blocks_update(inode, fio->compr_blocks - 1, false);
 
 	/* LFS mode write path */
+	ktget(&stopwatch[0]);
 	f2fs_outplace_write_data(&dn, fio);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_outplace_write_data);
 	trace_f2fs_do_write_data_page(folio, OPU);
 	set_inode_flag(inode, FI_APPEND_WRITE);
 	if (atomic_commit)
@@ -3233,6 +3297,19 @@ out:
 	if (fio->need_lock == LOCK_REQ)
 		f2fs_unlock_op(fio->sbi, &lc);
 	return err;
+}
+
+KTDEF(f3fs_do_write_data_page);
+
+int f2fs_do_write_data_page(struct f2fs_io_info *fio)
+{
+	ktime_t stopwatch[2];
+	int tmp;
+	ktget(&stopwatch[0]);
+	tmp = f2fs_do_write_data_page_internal(fio);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_do_write_data_page);
+	return tmp;
 }
 
 int f2fs_write_single_data_page(struct folio *folio, int *submitted,
@@ -3405,6 +3482,8 @@ redirty_out:
 	return err;
 }
 
+KTDEF(f3fs_write_single_data_page);
+
 /*
  * This function was copied from write_cache_pages from mm/page-writeback.c.
  * The major change is making write step of cold data page separately from
@@ -3414,6 +3493,7 @@ static int f2fs_write_cache_pages(struct address_space *mapping,
 					struct writeback_control *wbc,
 					enum iostat_type io_type)
 {
+	ktime_t stopwatch[2];
 	int ret = 0;
 	int done = 0, retry = 0;
 	struct page *pages_local[F2FS_ONSTACK_PAGES];
@@ -3609,9 +3689,12 @@ continue_unlock:
 			}
 #endif
 			submitted = 0;
+			ktget(&stopwatch[0]);
 			ret = f2fs_write_single_data_page(folio,
 					&submitted, &bio, &last_block,
 					wbc, io_type, 0, true);
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, f3fs_write_single_data_page);
 #ifdef CONFIG_F2FS_FS_COMPRESSION
 result:
 #endif
@@ -3741,10 +3824,13 @@ static inline void update_skipped_write(struct f2fs_sb_info *sbi,
 		atomic_add(skipped, &sbi->nr_pages[F2FS_SKIPPED_WRITE]);
 }
 
+KTDEF(f3fs_write_cache_pages);
+
 static int __f2fs_write_data_pages(struct address_space *mapping,
 						struct writeback_control *wbc,
 						enum iostat_type io_type)
 {
+	ktime_t stopwatch[2];
 	struct inode *inode = mapping->host;
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct blk_plug plug;
@@ -3790,7 +3876,10 @@ static int __f2fs_write_data_pages(struct address_space *mapping,
 	account_writeback(inode, true);
 
 	blk_start_plug(&plug);
+	ktget(&stopwatch[0]);
 	ret = f2fs_write_cache_pages(mapping, wbc, io_type);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_write_cache_pages);
 	blk_finish_plug(&plug);
 
 	account_writeback(inode, false);
@@ -3820,7 +3909,7 @@ skip_write:
 	return 0;
 }
 
-static int f2fs_write_data_pages(struct address_space *mapping,
+static int f2fs_write_data_pages_internal(struct address_space *mapping,
 			    struct writeback_control *wbc)
 {
 	struct inode *inode = mapping->host;
@@ -3828,6 +3917,20 @@ static int f2fs_write_data_pages(struct address_space *mapping,
 	return __f2fs_write_data_pages(mapping, wbc,
 			F2FS_I(inode)->cp_task == current ?
 			FS_CP_DATA_IO : FS_DATA_IO);
+}
+
+KTDEF(f3fs_write_data_pages);
+
+static int f2fs_write_data_pages(struct address_space *mapping,
+			    struct writeback_control *wbc)
+{
+	int tmp;
+	ktime_t stopwatch[2];
+	ktget(&stopwatch[0]);
+	tmp = f2fs_write_data_pages_internal(mapping, wbc);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_write_data_pages);
+	return tmp;
 }
 
 void f2fs_write_failed(struct inode *inode, loff_t to)
@@ -4051,11 +4154,17 @@ reserve_block:
 	return 0;
 }
 
+KTDEF(begin_1);
+KTDEF(begin_2);
+KTDEF(begin_3);
+KTDEF(begin_4);
+
 static int f2fs_write_begin(const struct kiocb *iocb,
 			    struct address_space *mapping,
 			    loff_t pos, unsigned len, struct folio **foliop,
 			    void **fsdata)
 {
+	ktime_t stopwatch[2];
 	struct inode *inode = mapping->host;
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct folio *folio;
@@ -4109,9 +4218,12 @@ repeat:
 	 * Do not use FGP_STABLE to avoid deadlock.
 	 * Will wait that below with our IO control.
 	 */
+	ktget(&stopwatch[0]);
 	folio = f2fs_filemap_get_folio(mapping, index,
 				FGP_LOCK | FGP_WRITE | FGP_CREAT | FGP_NOFS,
 				mapping_gfp_mask(mapping));
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, begin_1);
 	if (IS_ERR(folio)) {
 		err = PTR_ERR(folio);
 		goto fail;
@@ -4121,15 +4233,19 @@ repeat:
 
 	*foliop = folio;
 
+	ktget(&stopwatch[0]);
 	if (f2fs_is_atomic_file(inode))
 		err = prepare_atomic_write_begin(sbi, folio, pos, len,
 					&blkaddr, &need_balance);
 	else
 		err = prepare_write_begin(sbi, folio, pos, len,
 					&blkaddr, &need_balance);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, begin_2);
 	if (err)
 		goto put_folio;
 
+	ktget(&stopwatch[0]);
 	if (need_balance && !IS_NOQUOTA(inode) &&
 			has_not_enough_free_secs(sbi, 0, 0)) {
 		folio_unlock(folio);
@@ -4139,9 +4255,13 @@ repeat:
 			/* The folio got truncated from under us */
 			folio_unlock(folio);
 			folio_put(folio);
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, begin_3);
 			goto repeat;
 		}
 	}
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, begin_3);
 
 	f2fs_folio_wait_writeback(folio, DATA, false, true);
 
@@ -4154,6 +4274,7 @@ repeat:
 		return 0;
 	}
 
+	ktget(&stopwatch[0]);
 	if (blkaddr == NEW_ADDR) {
 		folio_zero_segment(folio, 0, folio_size(folio));
 		folio_mark_uptodate(folio);
@@ -4161,6 +4282,9 @@ repeat:
 		if (!f2fs_is_valid_blkaddr(sbi, blkaddr,
 				DATA_GENERIC_ENHANCE_READ)) {
 			err = -EFSCORRUPTED;
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, begin_4);
+
 			goto put_folio;
 		}
 		/*
@@ -4179,13 +4303,20 @@ repeat:
 		if (unlikely(folio->mapping != mapping)) {
 			folio_unlock(folio);
 			folio_put(folio);
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, begin_4);
 			goto repeat;
 		}
 		if (unlikely(!folio_test_uptodate(folio))) {
 			err = -EIO;
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, begin_4);
+
 			goto put_folio;
 		}
 	}
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, begin_4);
 	return 0;
 
 put_folio:
@@ -4195,11 +4326,14 @@ fail:
 	return err;
 }
 
-static int f2fs_write_end(const struct kiocb *iocb,
+KTDEF(set_page_dirty);
+
+static int f2fs_write_end_internal(const struct kiocb *iocb,
 			struct address_space *mapping,
 			loff_t pos, unsigned len, unsigned copied,
 			struct folio *folio, void *fsdata)
 {
+	ktime_t stopwatch[2];
 	struct inode *inode = folio->mapping->host;
 
 	trace_f2fs_write_end(inode, pos, len, copied);
@@ -4232,7 +4366,10 @@ static int f2fs_write_end(const struct kiocb *iocb,
 	if (!copied)
 		goto unlock_out;
 
+	ktget(&stopwatch[0]);
 	folio_mark_dirty(folio);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, set_page_dirty);
 
 	if (f2fs_is_atomic_file(inode))
 		folio_set_f2fs_atomic(folio);
@@ -4248,6 +4385,23 @@ unlock_out:
 	f2fs_folio_put(folio, true);
 	f2fs_update_time(F2FS_I_SB(inode), REQ_TIME);
 	return copied;
+}
+
+KTDEF(f3fs_write_end);
+
+static int f2fs_write_end(const struct kiocb *iocb,
+			struct address_space *mapping,
+			loff_t pos, unsigned len, unsigned copied,
+			struct folio *folio, void *fsdata)
+{
+	ktime_t stopwatch[2];
+	int tmp;
+	ktget(&stopwatch[0]);
+	tmp = f2fs_write_end_internal(iocb, mapping, pos, len, copied, folio, fsdata);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_write_end);
+
+	return tmp;
 }
 
 void f2fs_invalidate_folio(struct folio *folio, size_t offset, size_t length)

@@ -17,6 +17,7 @@
 #include "acl.h"
 #include "xattr.h"
 #include <trace/events/f2fs.h>
+#include "calc/calclock.h"
 
 static inline bool f2fs_should_fallback_to_linear(struct inode *dir)
 {
@@ -538,21 +539,36 @@ static int make_empty_dir(struct inode *inode,
 	return 0;
 }
 
+KTDEF(f3fs_new_inode_page);
+KTDEF(get_page);
+KTDEF(make_empty_dir);
+
 struct folio *f2fs_init_inode_metadata(struct inode *inode, struct inode *dir,
 		const struct f2fs_filename *fname, struct folio *dfolio)
 {
+	ktime_t stopwatch[2];
 	struct folio *folio;
 	int err;
 
 	if (is_inode_flag_set(inode, FI_NEW_INODE)) {
+		ktget(&stopwatch[0]);
 		folio = f2fs_new_inode_folio(inode);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_new_inode_page);
 		if (IS_ERR(folio))
 			return folio;
 
 		if (S_ISDIR(inode->i_mode)) {
 			/* in order to handle error case */
+			ktget(&stopwatch[0]);
 			folio_get(folio);
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, get_page);
+
+			ktget(&stopwatch[0]);
 			err = make_empty_dir(inode, dir, folio);
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, make_empty_dir);
 			if (err) {
 				folio_lock(folio);
 				goto put_error;
@@ -607,22 +623,43 @@ put_error:
 	return ERR_PTR(err);
 }
 
+KTDEF(f3fs_i_links_write);
+KTDEF(f3fs_mark_inode_dirty_sync);
+KTDEF(f3fs_i_depth_write);
+KTDEF(clear_inode_flag);
+
 void f2fs_update_parent_metadata(struct inode *dir, struct inode *inode,
 						unsigned int current_depth)
 {
+	ktime_t stopwatch[2];
 	if (inode && is_inode_flag_set(inode, FI_NEW_INODE)) {
-		if (S_ISDIR(inode->i_mode))
+		if (S_ISDIR(inode->i_mode)) {
+			ktget(&stopwatch[0]);
 			f2fs_i_links_write(dir, true);
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, f3fs_i_links_write);
+		}
 		clear_inode_flag(inode, FI_NEW_INODE);
 	}
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	ktget(&stopwatch[0]);
 	f2fs_mark_inode_dirty_sync(dir, true);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_mark_inode_dirty_sync);
 
-	if (F2FS_I(dir)->i_current_depth != current_depth)
+	if (F2FS_I(dir)->i_current_depth != current_depth) {
+		ktget(&stopwatch[0]);
 		f2fs_i_depth_write(dir, current_depth);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_i_depth_write);
+	}
 
-	if (inode && is_inode_flag_set(inode, FI_INC_LINK))
+	if (inode && is_inode_flag_set(inode, FI_INC_LINK)) {
+		ktget(&stopwatch[0]);
 		clear_inode_flag(inode, FI_INC_LINK);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, clear_inode_flag);
+	}
 }
 
 int f2fs_room_for_filename(const void *bitmap, int slots, int max_slots)
@@ -681,9 +718,22 @@ void f2fs_update_dentry(nid_t ino, umode_t mode, struct f2fs_dentry_ptr *d,
 	}
 }
 
+KTDEF(dir_buckets);
+KTDEF(dir_block_index);
+KTDEF(f3fs_get_new_data_page);
+KTDEF(f3fs_add_regular_entry_if1);
+KTDEF(f3fs_wait_on_page_writeback);
+KTDEF(f3fs_init_inode_metadata);
+KTDEF(f3fs_down_write_i_sem);
+KTDEF(f3fs_add_regular_entry_if3);
+KTDEF(f3fs_i_pino_write);
+KTDEF(f3fs_update_inode);
+KTDEF(f3fs_update_parent_metadata);
+
 int f2fs_add_regular_entry(struct inode *dir, const struct f2fs_filename *fname,
 			   struct inode *inode, nid_t ino, umode_t mode)
 {
+	ktime_t stopwatch[2];
 	unsigned int bit_pos;
 	unsigned int level;
 	unsigned int current_depth;
@@ -715,58 +765,97 @@ start:
 	if (level == current_depth)
 		++current_depth;
 
+	ktget(&stopwatch[0]);
 	nbucket = dir_buckets(level, F2FS_I(dir)->i_dir_level);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, dir_buckets);
 	nblock = bucket_blocks(level);
 
+	ktget(&stopwatch[0]);
 	bidx = dir_block_index(level, F2FS_I(dir)->i_dir_level,
 				(le32_to_cpu(fname->hash) % nbucket));
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, dir_block_index);
 
 	for (block = bidx; block <= (bidx + nblock - 1); block++) {
+		ktget(&stopwatch[0]);
 		dentry_folio = f2fs_get_new_data_folio(dir, NULL, block, true);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_get_new_data_page);
 		if (IS_ERR(dentry_folio))
 			return PTR_ERR(dentry_folio);
 
+		ktget(&stopwatch[0]);
 		dentry_blk = folio_address(dentry_folio);
 		bit_pos = f2fs_room_for_filename(&dentry_blk->dentry_bitmap,
 						slots, NR_DENTRY_IN_BLOCK);
-		if (bit_pos < NR_DENTRY_IN_BLOCK)
+		if (bit_pos < NR_DENTRY_IN_BLOCK) {
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, f3fs_add_regular_entry_if1);
 			goto add_dentry;
+		}
 
 		f2fs_folio_put(dentry_folio, true);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_add_regular_entry_if1);
 	}
 
 	/* Move to next level to find the empty slot for new dentry */
 	++level;
 	goto start;
 add_dentry:
+	ktget(&stopwatch[0]);
 	f2fs_folio_wait_writeback(dentry_folio, DATA, true, true);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_wait_on_page_writeback);
 
 	if (inode) {
+		ktget(&stopwatch[0]);
 		f2fs_down_write(&F2FS_I(inode)->i_sem);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_down_write_i_sem);
+
+		ktget(&stopwatch[0]);
 		folio = f2fs_init_inode_metadata(inode, dir, fname, NULL);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_init_inode_metadata);
+
 		if (IS_ERR(folio)) {
 			err = PTR_ERR(folio);
 			goto fail;
 		}
 	}
 
+	ktget(&stopwatch[0]);
 	make_dentry_ptr_block(NULL, &d, dentry_blk);
 	f2fs_update_dentry(ino, mode, &d, &fname->disk_name, fname->hash,
 			   bit_pos);
 
 	folio_mark_dirty(dentry_folio);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_add_regular_entry_if3);
 
 	if (inode) {
+		ktget(&stopwatch[0]);
 		f2fs_i_pino_write(inode, dir->i_ino);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_i_pino_write);
 
 		/* synchronize inode page's data from inode cache */
-		if (is_inode_flag_set(inode, FI_NEW_INODE))
+		if (is_inode_flag_set(inode, FI_NEW_INODE)) {
+			ktget(&stopwatch[0]);
 			f2fs_update_inode(inode, folio);
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, f3fs_update_inode);
+		}
 
 		f2fs_folio_put(folio, true);
 	}
 
+	ktget(&stopwatch[0]);
 	f2fs_update_parent_metadata(dir, inode, current_depth);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, f3fs_update_parent_metadata);
 fail:
 	if (inode)
 		f2fs_up_write(&F2FS_I(inode)->i_sem);
@@ -776,9 +865,14 @@ fail:
 	return err;
 }
 
+KTDEF(f3fs_down_read_i_xattr_sem);
+KTDEF(f3fs_add_inline_entry);
+KTDEF(f3fs_add_regular_entry);
+
 int f2fs_add_dentry(struct inode *dir, const struct f2fs_filename *fname,
 		    struct inode *inode, nid_t ino, umode_t mode)
 {
+	ktime_t stopwatch[2];
 	int err = -EAGAIN;
 
 	if (f2fs_has_inline_dentry(dir)) {
@@ -786,16 +880,32 @@ int f2fs_add_dentry(struct inode *dir, const struct f2fs_filename *fname,
 		 * Should get i_xattr_sem to keep the lock order:
 		 * i_xattr_sem -> inode_page lock used by f2fs_setxattr.
 		 */
+		ktget(&stopwatch[0]);
 		f2fs_down_read(&F2FS_I(dir)->i_xattr_sem);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_down_read_i_xattr_sem);
+
+		ktget(&stopwatch[0]);
 		err = f2fs_add_inline_entry(dir, fname, inode, ino, mode);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_add_inline_entry);
+
 		f2fs_up_read(&F2FS_I(dir)->i_xattr_sem);
 	}
-	if (err == -EAGAIN)
+	if (err == -EAGAIN) {
+		ktget(&stopwatch[0]);
 		err = f2fs_add_regular_entry(dir, fname, inode, ino, mode);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_add_regular_entry);
+	}
 
 	f2fs_update_time(F2FS_I_SB(dir), REQ_TIME);
 	return err;
 }
+
+KTDEF(__f3fs_find_entry);
+KTDEF(f3fs_put_page);
+KTDEF(f3fs_add_dentry);
 
 /*
  * Caller should grab and release a rwsem by calling f2fs_lock_op() and
@@ -804,6 +914,7 @@ int f2fs_add_dentry(struct inode *dir, const struct f2fs_filename *fname,
 int f2fs_do_add_link(struct inode *dir, const struct qstr *name,
 				struct inode *inode, nid_t ino, umode_t mode)
 {
+	ktime_t stopwatch[2];
 	struct f2fs_filename fname;
 	struct folio *folio = NULL;
 	struct f2fs_dir_entry *de = NULL;
@@ -821,16 +932,25 @@ int f2fs_do_add_link(struct inode *dir, const struct qstr *name,
 	 * consistency more.
 	 */
 	if (current != F2FS_I(dir)->task) {
+		ktget(&stopwatch[0]);
 		de = __f2fs_find_entry(dir, &fname, &folio);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, __f3fs_find_entry);
 		F2FS_I(dir)->task = NULL;
 	}
 	if (de) {
+		ktget(&stopwatch[0]);
 		f2fs_folio_put(folio, false);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_put_page);
 		err = -EEXIST;
 	} else if (IS_ERR(folio)) {
 		err = PTR_ERR(folio);
 	} else {
+		ktget(&stopwatch[0]);
 		err = f2fs_add_dentry(dir, &fname, inode, ino, mode);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, f3fs_add_dentry);
 	}
 	f2fs_free_filename(&fname);
 	return err;

@@ -23,6 +23,13 @@ delfs-$(CONFIG_F2FS_IOSTAT) += iostat.o
 # DeLFS dflush (see dflush.h)
 delfs-y		+= mm/filemap.o mm/page-writeback.o fs/fs-writeback.o
 
+# DeLFS calclock (see calc/README.md): off by default, as in 6.6.8 DeLFS.
+#   make CALCLOCK=1   measure, and print the results to dmesg at rmmod
+ifeq ($(CALCLOCK),1)
+ccflags-y	+= -DCONFIG_CALCLOCK
+delfs-y		+= calc/calclock.o
+endif
+
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 default:

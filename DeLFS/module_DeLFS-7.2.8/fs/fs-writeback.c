@@ -24,6 +24,10 @@
 #include <linux/writeback.h>
 
 #include "../dflush.h"
+#include "../calc/calclock.h"
+KTDEF(wb_check_start_all);
+KTDEF(wb_check_old_data_flush);
+KTDEF(df_wb_check_background_flush);
 
 /* 4MB minimal write chunk size (same as the kernel's MIN_WRITEBACK_PAGES) */
 #define MIN_WRITEBACK_PAGES		(4096UL >> (PAGE_SHIFT - 10))
@@ -36,9 +40,14 @@ static inline struct inode *wb_inode(struct list_head *head)
 	return list_entry(head, struct inode, i_io_list);
 }
 
+KTDEF(writeback_sb_inodes);
+KTDEF(__writeback_inodes_wb);
+KTDEF(inode_sleep_on_writeback);
+
 static long df_wb_writeback(struct bdi_writeback *wb,
 			    struct wb_writeback_work *work)
 {
+	ktime_t stopwatch[2];
 	long nr_pages = work->nr_pages;
 	unsigned long dirtied_before = jiffies;
 	struct inode *inode;
@@ -105,10 +114,17 @@ static long df_wb_writeback(struct bdi_writeback *wb,
 		 * dflush-probe.sh): it stopped the loop 4 times in ~3,650 calls.
 		 */
 
-		if (work->sb)
+		if (work->sb) {
+			ktget(&stopwatch[0]);
 			progress = writeback_sb_inodes(work->sb, wb, work);
-		else
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, writeback_sb_inodes);
+		} else {
+			ktget(&stopwatch[0]);
 			progress = __writeback_inodes_wb(wb, work);
+			ktget(&stopwatch[1]);
+			ktput(stopwatch, __writeback_inodes_wb);
+		}
 
 		/*
 		 * Did we write something? Try for more
@@ -140,7 +156,10 @@ static long df_wb_writeback(struct bdi_writeback *wb,
 		spin_lock(&inode->i_lock);
 		spin_unlock(&wb->list_lock);
 		/* This function drops i_lock... */
+		ktget(&stopwatch[0]);
 		inode_sleep_on_writeback(inode);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, inode_sleep_on_writeback);
 	}
 	blk_finish_plug(&plug);
 
@@ -179,6 +198,7 @@ static long df_wb_writeback(struct bdi_writeback *wb,
  */
 static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages)
 {
+	ktime_t stopwatch[2];
 	long wrote = 0;
 
 	if (nr_pages <= 0)
@@ -187,6 +207,8 @@ static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages)
 	if (atomic_inc_return(&wb->nr_threads) == 1)
 		set_bit(WB_writeback_running, &wb->state);
 
+	/* calclock: df_wb_check_background_flush() in 6.6.8 DeLFS */
+	ktget(&stopwatch[0]);
 	if (wb_over_bg_thresh(wb)) {
 		struct wb_writeback_work work = {
 			.nr_pages	= nr_pages,
@@ -198,6 +220,8 @@ static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages)
 
 		wrote += df_wb_writeback(wb, &work);
 	}
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, df_wb_check_background_flush);
 
 	if (atomic_dec_and_test(&wb->nr_threads))
 		clear_bit(WB_writeback_running, &wb->state);
@@ -209,8 +233,11 @@ static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages)
  * Called from f2fs_file_write_iter() right after inode_unlock().
  * Must not be called with inode->i_rwsem held (see dflush.h).
  */
+KTDEC(df_wb_do_writeback);
+
 long df_flush_deferred_writeback(struct address_space *mapping)
 {
+	ktime_t stopwatch[2];
 	struct inode *inode;
 	struct backing_dev_info *bdi;
 	struct bdi_writeback *wb = NULL;
@@ -232,7 +259,11 @@ long df_flush_deferred_writeback(struct address_space *mapping)
 	if (!wb)
 		wb = &bdi->wb;
 
+	/* calclock: df_wb_do_writeback() call in 6.6.8 df_balance_dirty_pages() */
+	ktget(&stopwatch[0]);
 	wrote = df_wb_do_writeback_limited(wb, DF_DEFERRED_WRITEBACK_PAGES);
+	ktget(&stopwatch[1]);
+	ktput(stopwatch, df_wb_do_writeback);
 
 	wb_put(wb);
 	return wrote;

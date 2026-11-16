@@ -19,9 +19,14 @@
 #include <linux/uio.h>
 
 #include "../dflush.h"
+#include "../calc/calclock.h"
+
+KTDEF(write_begin);
+KTDEF(write_end);
 
 ssize_t df_generic_perform_write(struct kiocb *iocb, struct iov_iter *i)
 {
+	ktime_t stopwatch[2];
 	struct file *file = iocb->ki_filp;
 	loff_t pos = iocb->ki_pos;
 	struct address_space *mapping = file->f_mapping;
@@ -49,8 +54,11 @@ retry:
 			break;
 		}
 
+		ktget(&stopwatch[0]);
 		status = a_ops->write_begin(iocb, mapping, pos, bytes,
 						&folio, &fsdata);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, write_begin);
 		if (unlikely(status < 0))
 			break;
 
@@ -70,8 +78,11 @@ retry:
 		copied = copy_folio_from_iter_atomic(folio, offset, bytes, i);
 		flush_dcache_folio(folio);
 
+		ktget(&stopwatch[0]);
 		status = a_ops->write_end(iocb, mapping, pos, bytes, copied,
 						folio, fsdata);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, write_end);
 		if (unlikely(status != copied)) {
 			iov_iter_revert(i, copied - max(status, 0L));
 			if (unlikely(status < 0))
