@@ -516,14 +516,23 @@ struct discard_policy {
 	unsigned int granularity;	/* discard granularity */
 };
 
+/* DeLFS: discard lists and rb-tree of one core region */
+struct discard_set {
+	struct list_head p_entry_list;		/* 4KB discard entry list */
+	struct list_head p_pend_list[MAX_PLIST_NUM];/* store pending entries */
+	struct list_head p_wait_list;		/* store on-flushing entries */
+	struct list_head p_fstrim_list;		/* in-flight discard from fstrim */
+
+	struct mutex p_cmd_lock;
+	struct rb_root_cached p_root;		/* root of discard rb-tree */
+};
+
 struct discard_cmd_control {
 	struct task_struct *f2fs_issue_discard;	/* discard thread */
-	struct list_head entry_list;		/* 4KB discard entry list */
-	struct list_head pend_list[MAX_PLIST_NUM];/* store pending entries */
-	struct list_head wait_list;		/* store on-flushing entries */
-	struct list_head fstrim_list;		/* in-flight discard from fstrim */
 	wait_queue_head_t discard_wait_queue;	/* waiting queue for wake-up */
-	struct mutex cmd_lock;
+
+	struct discard_set __percpu *ds;	/* DeLFS: per core region */
+
 	unsigned int nr_discards;		/* # of discards in the list */
 	unsigned int max_discards;		/* max. discards to be issued */
 	unsigned int max_discard_request;	/* max. discard request per round */
@@ -540,7 +549,6 @@ struct discard_cmd_control {
 	atomic_t issued_discard;		/* # of issued discard */
 	atomic_t queued_discard;		/* # of queued discard */
 	atomic_t discard_cmd_cnt;		/* # of cached cmd count */
-	struct rb_root_cached root;		/* root of discard rb-tree */
 	bool rbtree_check;			/* config for consistence check */
 	bool discard_wake;			/* to wake up discard thread */
 };
@@ -1791,6 +1799,10 @@ struct f2fs_sb_info {
 	unsigned long s_flag;				/* flags for sbi */
 	struct mutex writepages;		/* mutex for writepages() */
 
+	/* DeLFS deLLC (oldinv.c): deferred invalidation of old blocks */
+	atomic_t oldinv_cp_mode;		/* checkpoint drains the queues */
+	struct oldinv_ctx *oldinv;		/* per-core workers */
+
 #ifdef CONFIG_BLK_DEV_ZONED
 	unsigned int blocks_per_blkz;		/* F2FS blocks per zone */
 	unsigned int unusable_blocks_per_sec;   /* unusable blocks per section */
@@ -1933,7 +1945,7 @@ struct f2fs_sb_info {
 	unsigned int gc_remaining_trials;
 
 	/* for skip statistic */
-	unsigned long long skipped_gc_rwsem;		/* FG_GC only */
+	atomic64_t skipped_gc_rwsem;		/* FG_GC only (DeLFS: per-core GC) */
 
 	/* free sections reserved for pinned file */
 	unsigned int reserved_pin_section;
@@ -4052,6 +4064,11 @@ int f2fs_flush_device_cache(struct f2fs_sb_info *sbi);
 void f2fs_destroy_flush_cmd_control(struct f2fs_sb_info *sbi, bool free);
 void f2fs_invalidate_blocks(struct f2fs_sb_info *sbi, block_t addr,
 						unsigned int len);
+/* DeLFS: SIT helpers, also used by oldinv.c (deLLC) */
+void update_segment_mtime(struct f2fs_sb_info *sbi, block_t blkaddr,
+					unsigned long long old_mtime);
+void update_sit_entry(struct f2fs_sb_info *sbi, block_t blkaddr, int del);
+void locate_dirty_segment(struct f2fs_sb_info *sbi, unsigned int segno);
 bool f2fs_is_checkpointed_data(struct f2fs_sb_info *sbi, block_t blkaddr);
 int f2fs_start_discard_thread(struct f2fs_sb_info *sbi);
 void f2fs_drop_discard_cmd(struct f2fs_sb_info *sbi);
@@ -4287,7 +4304,8 @@ extern const struct iomap_ops f2fs_iomap_ops;
 int f2fs_start_gc_thread(struct f2fs_sb_info *sbi);
 void f2fs_stop_gc_thread(struct f2fs_sb_info *sbi);
 block_t f2fs_start_bidx_of_node(unsigned int node_ofs, struct inode *inode);
-int f2fs_gc(struct f2fs_sb_info *sbi, struct f2fs_gc_control *gc_control);
+int f2fs_gc(struct f2fs_sb_info *sbi, struct f2fs_gc_control *gc_control,
+								int cpu);
 void f2fs_build_gc_manager(struct f2fs_sb_info *sbi);
 int f2fs_gc_range(struct f2fs_sb_info *sbi,
 		unsigned int start_seg, unsigned int end_seg,
@@ -4298,7 +4316,7 @@ void f2fs_destroy_garbage_collection_cache(void);
 /* victim selection function for cleaning and SSR */
 int f2fs_get_victim(struct f2fs_sb_info *sbi, unsigned int *result,
 			int gc_type, int type, char alloc_mode,
-			unsigned long long age, bool one_time);
+			unsigned long long age, bool one_time, int cpu);
 
 /*
  * recovery.c
