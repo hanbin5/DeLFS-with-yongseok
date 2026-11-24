@@ -18,7 +18,7 @@
 #include "segment.h"
 #include "xattr.h"
 
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 
 #ifdef CONFIG_F2FS_FS_COMPRESSION
 extern const struct address_space_operations f2fs_compress_aops;

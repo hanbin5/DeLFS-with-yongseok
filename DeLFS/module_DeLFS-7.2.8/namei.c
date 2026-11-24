@@ -20,7 +20,7 @@
 #include "segment.h"
 #include "xattr.h"
 #include "acl.h"
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 #include "calc/calclock.h"
 
 static inline bool is_extension_exist(const unsigned char *s, const char *sub,

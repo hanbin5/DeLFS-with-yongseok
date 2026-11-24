@@ -18,7 +18,7 @@
 #include "segment.h"
 #include "gc.h"
 #include "iostat.h"
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 
 static struct proc_dir_entry *f2fs_proc_root;
 

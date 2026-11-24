@@ -19,7 +19,7 @@
 #include "segment.h"
 #include "xattr.h"
 #include "iostat.h"
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 #include "calc/calclock.h"
 
 #define on_f2fs_build_free_nids(nm_i) mutex_is_locked(&(nm_i)->build_lock)

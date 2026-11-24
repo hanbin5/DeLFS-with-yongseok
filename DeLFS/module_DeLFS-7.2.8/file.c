@@ -34,7 +34,7 @@
 #include "gc.h"
 #include "iostat.h"
 #include "dflush.h"
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 #include <uapi/linux/f2fs.h>
 #include "calc/calclock.h"
 

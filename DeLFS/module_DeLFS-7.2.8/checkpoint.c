@@ -23,7 +23,7 @@
 #include "segment.h"
 #include "iostat.h"
 #include "oldinv.h"	/* DeLFS deLLC (B) */
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 #include "calc/calclock.h"
 
 static inline void get_lock_elapsed_time(struct f2fs_time_stat *ts)

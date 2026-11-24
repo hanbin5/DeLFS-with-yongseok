@@ -13,7 +13,7 @@
 
 #include "f2fs.h"
 #include "node.h"
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 
 static bool support_inline_data(struct inode *inode)
 {

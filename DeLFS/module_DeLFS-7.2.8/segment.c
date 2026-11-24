@@ -25,7 +25,7 @@
 #include "gc.h"
 #include "iostat.h"
 #include "oldinv.h"	/* DeLFS deLLC (B) */
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 #include "calc/calclock.h"
 KTDEF(submit_bio);
 KTDEF(curseg_lock__allocate_data_block);

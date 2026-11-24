@@ -27,7 +27,7 @@
 #include "node.h"
 #include "segment.h"
 #include "iostat.h"
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 #include "calc/calclock.h"
 
 #define NUM_PREALLOC_POST_READ_CTXS	128

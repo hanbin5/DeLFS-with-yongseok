@@ -12,7 +12,7 @@
 
 #include "f2fs.h"
 #include "iostat.h"
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 
 static struct kmem_cache *bio_iostat_ctx_cache;
 static mempool_t *bio_iostat_ctx_pool;

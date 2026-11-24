@@ -20,6 +20,10 @@ delfs-$(CONFIG_FS_VERITY) += verity.o
 delfs-$(CONFIG_F2FS_FS_COMPRESSION) += compress.o
 delfs-$(CONFIG_F2FS_IOSTAT) += iostat.o
 
+# Trace events come from the module copy delfs_trace.h (system "delfs").
+# define_trace.h re-includes it via TRACE_INCLUDE_PATH, which needs the module dir.
+CFLAGS_super.o	+= -I$(src)
+
 # DeLFS dflush (see dflush.h)
 delfs-y		+= mm/filemap.o mm/page-writeback.o fs/fs-writeback.o
 

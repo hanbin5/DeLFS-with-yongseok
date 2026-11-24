@@ -17,7 +17,7 @@
 
 #include "f2fs.h"
 #include "node.h"
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 
 static inline int ino_to_extent_cpu(struct extent_tree_info *eti, nid_t ino)
 {

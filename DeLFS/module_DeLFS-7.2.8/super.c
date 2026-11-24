@@ -40,7 +40,7 @@
 #include "oldinv.h"	/* DeLFS deLLC (B) */
 
 #define CREATE_TRACE_POINTS
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 #include "calc/calclock.h"
 
 static struct kmem_cache *f2fs_inode_cachep;

@@ -19,7 +19,7 @@
 #include "f2fs.h"
 #include "node.h"
 #include "segment.h"
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 
 static struct kmem_cache *cic_entry_slab;
 static struct kmem_cache *dic_entry_slab;

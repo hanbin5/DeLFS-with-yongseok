@@ -16,7 +16,7 @@
 #include "node.h"
 #include "acl.h"
 #include "xattr.h"
-#include <trace/events/f2fs.h>
+#include "delfs_trace.h"
 #include "calc/calclock.h"
 
 static inline bool f2fs_should_fallback_to_linear(struct inode *dir)
