@@ -1198,13 +1198,36 @@ void f2fs_submit_page_write(struct f2fs_io_info *fio)
 	struct folio *bio_folio;
 	struct f2fs_lock_context lc;
 	enum count_type type;
+	/* the caller's own fio; @fio may move on to other io_list entries */
+	struct f2fs_io_info *target_fio = fio;
+	bool target_only;
 
 	f2fs_bug_on(sbi, is_read_io(fio->op));
+
+	/*
+	 * DeLFS GC (from 6.6.8 DeLFS): a GC write may run while the GC path
+	 * holds the inode's i_gc_rwsem.  Do not let it drain unrelated
+	 * per-core io_list entries; it submits only its own fio.
+	 */
+	target_only = fio->in_list &&
+		(fio->io_type == FS_GC_DATA_IO ||
+		 fio->io_type == FS_GC_NODE_IO ||
+		 (fio->folio && folio_test_f2fs_gcing(fio->folio)));
 
 	ktget(&stopwatch[0]);
 	f2fs_down_write_trace(&io->io_rwsem, &lc);
 	ktget(&stopwatch[1]);
 	ktput(stopwatch, io_rwsem__submit_page_write);
+
+	/*
+	 * DeLFS: another submitter already took this stack-local fio from
+	 * io_list and submitted it (under io_rwsem, which we now hold), so
+	 * this caller must not drain unrelated queue entries.
+	 * This relies on the caller clearing fio->submitted before it is
+	 * queued (designated initializers; compress.c resets it per page).
+	 */
+	if (target_fio->in_list && target_fio->submitted)
+		goto out;
 next:
 #ifdef CONFIG_BLK_DEV_ZONED
 	if (f2fs_sb_has_blkzoned(sbi) && btype < META && io->zone_pending_bio) {
@@ -1215,7 +1238,20 @@ next:
 	}
 #endif
 
-	if (fio->in_list) {
+	if (target_only) {
+		/* DeLFS GC: take only the caller's own fio off io_list */
+		spin_lock(&io->io_lock);
+		if (target_fio->submitted || list_empty(&target_fio->list)) {
+			spin_unlock(&io->io_lock);
+			goto out;
+		}
+		list_del_init(&target_fio->list);
+		spin_unlock(&io->io_lock);
+
+		fio = target_fio;
+		/* ends the loop below after this one fio */
+		fio->in_list = 0;
+	} else if (fio->in_list) {
 		ktget(&stopwatch[0]);
 		spin_lock(&io->io_lock);
 		ktget(&stopwatch[1]);
@@ -1226,7 +1262,8 @@ next:
 		}
 		fio = list_first_entry(&io->io_list,
 						struct f2fs_io_info, list);
-		list_del(&fio->list);
+		/* _init: lets target_only's list_empty() see a taken fio */
+		list_del_init(&fio->list);
 		spin_unlock(&io->io_lock);
 	}
 
@@ -1308,6 +1345,15 @@ alloc_new:
 		__submit_merged_bio(io);
 	}
 #endif
+	/*
+	 * DeLFS GC: a GC write is progress-critical.  Once its own folio is
+	 * in the bio, submit the bio now instead of leaving it in this
+	 * per-core merge bio.  This does not drain io_list.
+	 * (6.6.8 also checked !fio->retry; 7.2.8 has no fio->retry.)
+	 */
+	if (target_only && io->bio)
+		__submit_merged_bio(io);
+
 	if (fio->in_list)
 		goto next;
 out:
