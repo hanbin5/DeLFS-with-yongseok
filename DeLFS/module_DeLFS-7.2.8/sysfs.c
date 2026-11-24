@@ -2027,7 +2027,7 @@ int __init f2fs_init_sysfs(void)
 {
 	int ret;
 
-	kobject_set_name(&f2fs_kset.kobj, "f2fs");
+	kobject_set_name(&f2fs_kset.kobj, "delfs");	/* DeLFS: was "f2fs" */
 	f2fs_kset.kobj.parent = fs_kobj;
 	ret = kset_register(&f2fs_kset);
 	if (ret)
@@ -2043,7 +2043,7 @@ int __init f2fs_init_sysfs(void)
 	if (ret)
 		goto put_feat;
 
-	f2fs_proc_root = proc_mkdir("fs/f2fs", NULL);
+	f2fs_proc_root = proc_mkdir("fs/delfs", NULL);	/* DeLFS: was "fs/f2fs" */
 	if (!f2fs_proc_root) {
 		ret = -ENOMEM;
 		goto put_tune;
@@ -2065,7 +2065,7 @@ void f2fs_exit_sysfs(void)
 	kobject_put(&f2fs_tune);
 	kobject_put(&f2fs_feat);
 	kset_unregister(&f2fs_kset);
-	remove_proc_entry("fs/f2fs", NULL);
+	remove_proc_entry("fs/delfs", NULL);	/* DeLFS: was "fs/f2fs" */
 	f2fs_proc_root = NULL;
 }
 
