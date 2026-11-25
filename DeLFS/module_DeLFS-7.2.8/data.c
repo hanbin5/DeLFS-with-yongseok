@@ -3966,16 +3966,17 @@ static int prepare_write_begin(struct f2fs_sb_info *sbi,
 	int flag = F2FS_GET_BLOCK_PRE_AIO;
 	int err = 0;
 
+	/*
+	 * A preallocated full-folio write won't read the old block. Check
+	 * this before searching the read extent cache on every overwrite.
+	 */
+	if (len == PAGE_SIZE && !folio_test_large(folio) &&
+	    is_inode_flag_set(inode, FI_PREALLOCATED_ALL))
+		return 0;
+
 	if (!f2fs_has_inline_data(inode) && !f2fs_compressed_file(inode) &&
 	    (pos & PAGE_MASK) < i_size_read(inode) &&
 	    f2fs_lookup_read_extent_cache_block(inode, index, blk_addr))
-		return 0;
-
-	/*
-	 * If a whole page is being written and we already preallocated all the
-	 * blocks, then there is no need to get a block address now.
-	 */
-	if (len == PAGE_SIZE && is_inode_flag_set(inode, FI_PREALLOCATED_ALL))
 		return 0;
 
 	/* f2fs_lock_op avoids race between write CP and convert_inline_page */
