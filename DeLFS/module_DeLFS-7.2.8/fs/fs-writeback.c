@@ -7,7 +7,9 @@
  *   - tracepoints removed (the module cannot call the kernel's
  *     writeback tracepoints);
  *   - the 6.6.8 DeLFS re-check of the background threshold after filling
- *     b_io is not ported (see the comment in the loop).
+ *     b_io is not ported (see the comment in the loop);
+ *   - a pass that wrote nothing ends the loop as in 6.6.8 DeLFS; the
+ *     "queued once" retry of 7.2.8 is not used (see the comment in the loop).
  *
  * The kernel patch (DeLFS/linux-7.2.8) exports what this file needs:
  * struct wb_writeback_work (moved to <linux/writeback.h>), wb_queue_io()
@@ -53,7 +55,6 @@ static long df_wb_writeback(struct bdi_writeback *wb,
 	struct inode *inode;
 	long progress;
 	struct blk_plug plug;
-	bool queued = false;
 
 	blk_start_plug(&plug);
 	for (;;) {
@@ -98,7 +99,6 @@ static long df_wb_writeback(struct bdi_writeback *wb,
 				dirtied_before = jiffies;
 
 			wb_queue_io(wb, work, dirtied_before);
-			queued = true;
 		}
 
 		/*
@@ -133,8 +133,20 @@ static long df_wb_writeback(struct bdi_writeback *wb,
 		 * The completion of the current batch does not necessarily
 		 * mean the overall work is done. So we keep looping as long
 		 * as made some progress on cleaning pages or inodes.
+		 *
+		 * DeLFS: 7.2.8 wb_writeback() also loops again when this call
+		 * has not refilled b_io yet ("|| !queued"), so that the single
+		 * flusher does not give up before looking at b_dirty.  dflush
+		 * does not need that: it is called again after every write(),
+		 * and the flusher still runs the kernel's own loop.  With many
+		 * writer threads the retry is expensive.  While a checkpoint
+		 * holds cp_rwsem no data page can be written, so a pass walks
+		 * every dirty page of every free inode and puts it back; the
+		 * retry makes each thread that found b_io non-empty do that
+		 * walk twice.  6.6.8 DeLFS stops (or sleeps on a busy inode)
+		 * after one pass without progress, and so does this.
 		 */
-		if (progress || !queued) {
+		if (progress) {
 			spin_unlock(&wb->list_lock);
 			continue;
 		}
