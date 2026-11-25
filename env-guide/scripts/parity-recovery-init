@@ -1,0 +1,82 @@
+#!/bin/busybox sh
+# PID 1 in the private RAM root ONLY. Never use a guest panic or poweroff.
+[ "$$" -eq 1 ] || exit 2
+set -eu
+bb=/bin/busybox
+$bb mount -t proc proc /proc
+$bb mount -t sysfs sysfs /sys
+$bb mount -t devtmpfs devtmpfs /dev
+for arg in $($bb cat /proc/cmdline); do
+	case "$arg" in
+	pr.phase=*) phase=${arg#*=};;
+	pr.release=*) release=${arg#*=};;
+	pr.token=*) token=${arg#*=};;
+	esac
+done
+stop() {
+	echo "PR:$token:error:$1"
+	while :; do $bb sleep 300; done
+}
+trap 'stop "guest setup or I/O failed"' EXIT
+case "$($bb uname -r)" in "$release"|"$release"-*) ;; *) stop "kernel release";; esac
+[ "$($bb grep -c '^processor[[:space:]]*:' /proc/cpuinfo)" -eq 16 ]
+[ "$($bb cat /sys/class/block/vda/serial)" = "pr-$token" ]
+[ "$($bb cat /sys/class/block/vda/size)" = "16777216" ] # 8 GiB in 512-byte sectors
+[ -b /dev/vda ] && [ ! -e /sys/class/block/vda/partition ] || stop "disk"
+PATH=/bin:/usr/bin:/sbin:/usr/sbin; export PATH
+formatter=$(command -v mkfs.delfs)
+echo "guest release=$($bb uname -r) online=$($bb cat /sys/devices/system/cpu/online)"
+$bb sha256sum "$formatter" /pr/delfs.ko
+$bb insmod /pr/delfs.ko
+$bb mkdir -p /mnt/recovery
+mnt=/mnt/recovery
+mount_test() {
+	$bb mount -t delfs /dev/vda "$mnt" || stop "${1:-initial mount failed}"
+	$bb grep "^/dev/vda $mnt delfs rw," /proc/mounts
+	cd "$mnt"
+}
+unmount_test() {
+	cd /
+	$bb umount "$mnt"
+}
+ops=/pr/ops
+case "$phase" in
+publish)
+	"$formatter" -f /dev/vda
+	mount_test
+	$ops put clean
+	unmount_test
+	mount_test assert:remount
+	$ops get clean || stop 'assert:remount'
+	echo "PR:$token:remount"
+	$ops put cut
+	# No syncfs, explicit checkpoint, remount or clean shutdown after this write.
+	;;
+restart)
+	mount_test assert:fsync
+	$ops get cut || stop 'assert:fsync'
+	echo "PR:$token:fsync"
+	$ops rotate 0
+	unmount_test
+	;;
+rotate1|rotate2)
+	mount_test assert:checkpoint
+	$ops rotate "${phase#rotate}" || stop 'assert:checkpoint'
+	;;
+orphan)
+	mount_test assert:checkpoint
+	$ops generation2 || stop 'assert:checkpoint'
+	echo "PR:$token:checkpoint"
+	$ops orphan "$token" || stop 'assert:orphan'
+	stop "orphan holder returned"
+	;;
+reclaim)
+	mount_test assert:orphan
+	$ops reclaimed || stop 'assert:orphan'
+	$ops get cut || stop 'assert:fsync'
+	unmount_test
+	;;
+*) stop "phase";;
+esac
+echo "PR:$token:ack:$phase"
+while :; do $bb sleep 300; done
