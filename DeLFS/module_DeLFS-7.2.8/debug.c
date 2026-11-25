@@ -253,8 +253,15 @@ static void update_general_status(struct f2fs_sb_info *sbi)
 		* 100 / (int)((block_t)atomic_read(&sbi->user_block_count) >> sbi->log_blocks_per_seg)
 		/ 2;
 	si->util_invalid = 50 - si->util_free - si->util_valid;
+	/*
+	 * DeLFS: the global curseg array is not allocated (cursegs are
+	 * per-core), so CURSEG_I() here read through a NULL pointer and the
+	 * reader died with f2fs_stat_lock held.  Show the cursegs of the first
+	 * online core instead.
+	 */
 	for (i = CURSEG_HOT_DATA; i < NO_CHECK_TYPE; i++) {
-		struct curseg_info *curseg = CURSEG_I(sbi, i);
+		struct curseg_info *curseg = WRAP_CURSEG_I(sbi,
+				cpumask_first(cpu_online_mask))->array + i;
 
 		si->blkoff[i] = curseg->next_blkoff;
 		si->curseg[i] = curseg->segno;
