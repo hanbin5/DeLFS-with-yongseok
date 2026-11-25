@@ -764,13 +764,9 @@ static inline void get_additional_blocks_required(struct f2fs_sb_info *sbi,
 			*total_data_blocks - free_data_blocks : 0;
 }
 
-/*
- * call get_additional_blocks_required to calculate dirty blocks
- * needing to be placed in free sections, please note that, it
- * needs to account dirty data as well in lfs mode when checkpoint
- * is disabled.
- */
-static inline int __get_secs_required(struct f2fs_sb_info *sbi)
+/* With a nonzero budget, a sufficient upper bound may replace the exact count. */
+static inline int get_secs_required_with_budget(struct f2fs_sb_info *sbi,
+						unsigned int budget)
 {
 	unsigned int total_node_blocks = get_pages(sbi, F2FS_DIRTY_NODES) +
 					get_pages(sbi, F2FS_DIRTY_DENTS) +
@@ -792,12 +788,28 @@ static inline int __get_secs_required(struct f2fs_sb_info *sbi)
 		separate_dent = false;
 	}
 
+	/*
+	 * Ignore curseg space. Rounding each of three categories up separately
+	 * can cost at most two more sections than rounding their sum up once.
+	 * Use wide block counts before testing this sufficient condition.
+	 */
+	if (budget >= 2 &&
+	    (u64)total_node_blocks + total_dent_blocks + total_data_blocks <=
+			(u64)(budget - 2) * CAP_BLKS_PER_SEC(sbi))
+		return budget;
+
 	get_additional_blocks_required(sbi, &total_node_blocks, &total_dent_blocks,
 			&total_data_blocks, separate_dent);
 
 	return DIV_ROUND_UP(total_node_blocks, CAP_BLKS_PER_SEC(sbi)) +
 			DIV_ROUND_UP(total_dent_blocks, CAP_BLKS_PER_SEC(sbi)) +
 			DIV_ROUND_UP(total_data_blocks, CAP_BLKS_PER_SEC(sbi));
+}
+
+static inline int __get_secs_required(struct f2fs_sb_info *sbi)
+{
+	/* GC sizing needs the exact count, not a sufficient upper bound. */
+	return get_secs_required_with_budget(sbi, 0);
 }
 
 KTDEC(__get_secs_required);
@@ -807,7 +819,7 @@ static inline bool has_not_enough_free_secs(struct f2fs_sb_info *sbi,
 					int freed, int needed)
 {
 	ktime_t stopwatch[2];
-	unsigned int free_secs, required_secs;
+	unsigned int free_secs, required_secs, reserve;
 
 	if (unlikely(is_sbi_flag_set(sbi, SBI_POR_DOING)))
 		return false;
@@ -818,8 +830,9 @@ static inline bool has_not_enough_free_secs(struct f2fs_sb_info *sbi,
 	ktput(stopwatch, has_1);
 
 	ktget(&stopwatch[0]);
-	required_secs = needed + reserved_sections(sbi) +
-			__get_secs_required(sbi);
+	reserve = needed + reserved_sections(sbi);
+	required_secs = reserve + get_secs_required_with_budget(sbi,
+				free_secs > reserve ? free_secs - reserve : 0);
 	ktget(&stopwatch[1]);
 	ktput(stopwatch, __get_secs_required);
 
