@@ -362,7 +362,7 @@ static void __set_nat_cache_dirty(struct f2fs_nm_info *nm_i,
 		//nm_i->nat_cnt[RECLAIMABLE_NAT]--;
 		atomic_sub(1, &nm_i->nat_cnt[RECLAIMABLE_NAT]);
 	set_nat_flag(ne, IS_DIRTY, true);
-refresh_list:
+refresh_list:;
 	spinlock_t *p_nat_list_lock = per_cpu_ptr(nm_i->p_nat_list_lock, nat_cpu);
 	spin_lock(p_nat_list_lock);
 	if (new_ne)
@@ -729,7 +729,7 @@ int f2fs_get_node_info(struct f2fs_sb_info *sbi, nid_t nid,
 
 	ni->flag = 0;
 	ni->nid = nid;
-retry:
+retry:;
 	/* Check nat cache */
 	struct f2fs_rwsem *p_nat_tree_lock = per_cpu_ptr(nm_i->p_nat_tree_lock, nat_cpu);
 	ktget(&stopwatch[0]);
