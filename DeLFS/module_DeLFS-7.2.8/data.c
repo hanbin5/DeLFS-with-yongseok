@@ -588,6 +588,8 @@ static void f2fs_submit_write_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 				  enum page_type type)
 {
 	ktime_t stopwatch[2];
+	unsigned int bytes = bio->bi_iter.bi_size;
+
 	WARN_ON_ONCE(is_read_io(bio_op(bio)));
 	trace_f2fs_submit_write_bio(sbi->sb, type, bio);
 	iostat_update_submit_ctx(bio, type);
@@ -595,6 +597,20 @@ static void f2fs_submit_write_bio(struct f2fs_sb_info *sbi, struct bio *bio,
 	blk_crypto_submit_bio(bio);
 	ktget(&stopwatch[1]);
 	ktput(stopwatch, submit_write_bio);
+
+	/*
+	 * The block layer flushes a plug once a plugged request reaches 128K.
+	 * 6.6.8 tested the newest request; 7.2.8 tests the oldest, so a small
+	 * first request lets a long writeback plug (dflush holds one for up
+	 * to 64 MiB) collect 32 large log requests and send them in a burst.
+	 * Send large log bios on as 6.6.8 did; this only changes batching.
+	 */
+	if ((type == DATA || type == NODE) && bytes >= SZ_128K && current->plug) {
+		struct blk_plug *plug = current->plug;
+
+		blk_finish_plug(plug);
+		blk_start_plug(plug);
+	}
 }
 
 static void __submit_merged_bio(struct f2fs_bio_info *io)
