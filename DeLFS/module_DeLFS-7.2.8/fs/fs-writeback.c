@@ -18,8 +18,11 @@
 #include <linux/atomic.h>
 #include <linux/backing-dev.h>
 #include <linux/blkdev.h>
+#include <linux/cgroup.h>
 #include <linux/fs.h>
 #include <linux/jiffies.h>
+#include <linux/percpu.h>
+#include <linux/rcupdate.h>
 #include <linux/spinlock.h>
 #include <linux/writeback.h>
 
@@ -196,7 +199,8 @@ static long df_wb_writeback(struct bdi_writeback *wb,
  * nr_threads is 0, and the dec/clear vs inc/set pair must be made atomic
  * (e.g. under a lock).
  */
-static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages)
+static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages,
+				       bool *over)
 {
 	long wrote = 0;
 
@@ -206,7 +210,8 @@ static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages)
 	if (atomic_inc_return(&wb->nr_threads) == 1)
 		set_bit(WB_writeback_running, &wb->state);
 
-	if (wb_over_bg_thresh(wb)) {
+	*over = wb_over_bg_thresh(wb);
+	if (*over) {
 		ktime_t stopwatch[2];
 		struct wb_writeback_work work = {
 			.nr_pages	= nr_pages,
@@ -235,6 +240,113 @@ static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages)
 }
 
 /*
+ * DeLFS: short-lived cache of "this wb is below the background threshold".
+ *
+ * Like 6.6.8 DeLFS, this port ran the cgroup wb lookup + reference and
+ * wb_over_bg_thresh() after every write().  On 128 cores (4 KiB buffered
+ * randwrite, 128 jobs, RAM disk) that path took 14.36% of all CPU time here
+ * vs 5.01% in 6.6.8 DeLFS: per-call work, not contention
+ * (wb_over_bg_thresh() zeroes two dirty_throttle_control structs and does
+ * 64-bit divisions).
+ *
+ * Only a "below" result is cached, for at most DF_BG_BELOW_CACHE_JIFFIES.
+ * While it is valid, the writer returns before the wb lookup and the check.
+ * An "over" result is never cached: every writer keeps doing the full lookup,
+ * the check and the writeback, exactly as before.  With approach B the
+ * writer never sleeps in balance_dirty_pages(), so this writeback is its only
+ * brake, and the brake must stay on for every writer regardless of write
+ * size (skipping by write size, 00d31d7, cost YCSB A 0.61x).
+ *
+ * Where it lives: per CPU, keyed by what selects the wb without looking it
+ * up.  wb_find_current() picks the wb from (bdi, current's memcg css, and
+ * current's blkcg css); the key holds the same three pointers (the two css
+ * are NULL when cgroup writeback is off for the inode, i.e. &bdi->wb).
+ * Reading them is two task_css() loads; no radix tree lookup, no wb
+ * reference.  A per-wb or per-bdi field would need the lookup first, or
+ * would mix up the verdicts of different cgroups' wbs.  Per CPU also means
+ * no cache line is written by more than one CPU.
+ *
+ * Cost of a stale entry: a writer may skip the check for up to
+ * DF_BG_BELOW_CACHE_JIFFIES after its wb crossed the background threshold
+ * (the async balance in step 1 still wakes the flusher meanwhile).  Once the
+ * entry expires, the next write() on that CPU does the full check.  The
+ * pointers are compared, never dereferenced; if a bdi or css is freed and
+ * its address reused within the window, the effect is the same bounded skip.
+ *
+ * TODO(measure): the saving is only on calls made while the wb is below the
+ * background threshold.  The share of such calls in fio rand-write-600m /
+ * YCSB A is not measured; if the wb is mostly over the threshold, this
+ * changes little.
+ * TODO(measure): 1 jiffy is 1 ms at HZ=1000 and 4 ms at HZ=250.  The HZ of
+ * the 128-core server kernel was not checked here.
+ */
+#define DF_BG_BELOW_CACHE_JIFFIES	1	/* 0 disables the cache */
+
+struct df_bg_key {
+	const struct backing_dev_info	*bdi;
+	const void			*memcg_css;
+	const void			*blkcg_css;
+};
+
+struct df_bg_below_cache {
+	struct df_bg_key	key;
+	unsigned long		stamp;	/* jiffies of the "below" check */
+};
+static DEFINE_PER_CPU(struct df_bg_below_cache, df_bg_below_cache);
+
+static inline void df_bg_key_init(struct df_bg_key *key,
+				  struct backing_dev_info *bdi, bool cgwb)
+{
+	key->bdi = bdi;
+	key->memcg_css = NULL;
+	key->blkcg_css = NULL;
+#ifdef CONFIG_CGROUP_WRITEBACK
+	if (cgwb) {
+		/* same css as wb_find_current() uses; pointers only */
+		rcu_read_lock();
+		key->memcg_css = task_css(current, memory_cgrp_id);
+		key->blkcg_css = task_css(current, io_cgrp_id);
+		rcu_read_unlock();
+	}
+#endif
+}
+
+static inline bool df_bg_below_cached(const struct df_bg_key *key)
+{
+	struct df_bg_below_cache *c;
+	bool hit;
+
+	if (!DF_BG_BELOW_CACHE_JIFFIES)
+		return false;
+
+	c = get_cpu_ptr(&df_bg_below_cache);
+	hit = c->key.bdi == key->bdi &&
+	      c->key.memcg_css == key->memcg_css &&
+	      c->key.blkcg_css == key->blkcg_css &&
+	      time_before(jiffies, c->stamp + DF_BG_BELOW_CACHE_JIFFIES);
+	put_cpu_ptr(&df_bg_below_cache);
+	return hit;
+}
+
+static inline void df_bg_below_store(const struct df_bg_key *key,
+				     unsigned long stamp)
+{
+	struct df_bg_below_cache *c;
+
+	if (!DF_BG_BELOW_CACHE_JIFFIES)
+		return;
+
+	/*
+	 * May run on another CPU than the lookup if the task migrated; the
+	 * key describes the task, not the CPU, so the entry is still right.
+	 */
+	c = get_cpu_ptr(&df_bg_below_cache);
+	c->key = *key;
+	c->stamp = stamp;
+	put_cpu_ptr(&df_bg_below_cache);
+}
+
+/*
  * Called from f2fs_file_write_iter() right after inode_unlock().
  * Must not be called with inode->i_rwsem held (see dflush.h).
  */
@@ -245,6 +357,9 @@ long df_flush_deferred_writeback(struct address_space *mapping)
 	struct inode *inode;
 	struct backing_dev_info *bdi;
 	struct bdi_writeback *wb = NULL;
+	struct df_bg_key key;
+	unsigned long stamp;
+	bool cgwb, over;
 	long wrote;
 
 	if (!mapping)
@@ -258,13 +373,30 @@ long df_flush_deferred_writeback(struct address_space *mapping)
 	if (!(bdi->capabilities & BDI_CAP_WRITEBACK))
 		return 0;
 
-	if (inode_cgwb_enabled(inode))
+	cgwb = inode_cgwb_enabled(inode);
+	df_bg_key_init(&key, bdi, cgwb);
+
+	/* fast path: recently below the background threshold */
+	if (df_bg_below_cached(&key))
+		return 0;
+
+	stamp = jiffies;
+	if (cgwb)
 		wb = wb_get_create_current(bdi, GFP_KERNEL);
 	if (!wb)
 		wb = &bdi->wb;
 
 	/* not timed per poll: see df_wb_do_writeback_limited() */
-	wrote = df_wb_do_writeback_limited(wb, DF_DEFERRED_WRITEBACK_PAGES);
+	wrote = df_wb_do_writeback_limited(wb, DF_DEFERRED_WRITEBACK_PAGES,
+					   &over);
+
+	/*
+	 * Cache only a "below" result.  After writeback the wb may be below
+	 * too, but the loop also stops for other reasons (nr_pages used up,
+	 * queued work, no inodes), so the next write() checks again.
+	 */
+	if (!over)
+		df_bg_below_store(&key, stamp);
 
 	wb_put(wb);
 	return wrote;
