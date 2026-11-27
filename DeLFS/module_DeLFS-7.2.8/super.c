@@ -5120,6 +5120,13 @@ try_onemore:
 	if (!sbi)
 		return -ENOMEM;
 
+	/* DeLFS: per-CPU cp_rwsem, freed right before every kfree(sbi) */
+	sbi->cp_rwsem_pcpu = alloc_percpu(struct f2fs_rwsem);
+	if (!sbi->cp_rwsem_pcpu) {
+		kfree(sbi);
+		return -ENOMEM;
+	}
+
 	sbi->sb = sb;
 
 	/* initialize locks within allocated memory */
@@ -5134,7 +5141,9 @@ try_onemore:
 	init_f2fs_rwsem_trace(&sbi->node_write, sbi, LOCK_NAME_NODE_WRITE);
 	init_f2fs_rwsem_trace(&sbi->node_change, sbi, LOCK_NAME_NODE_CHANGE);
 	spin_lock_init(&sbi->stat_lock);
-	init_f2fs_rwsem_trace(&sbi->cp_rwsem, sbi, LOCK_NAME_CP_RWSEM);
+	for_each_possible_cpu(i)
+		init_f2fs_rwsem_trace(per_cpu_ptr(sbi->cp_rwsem_pcpu, i), sbi,
+				      LOCK_NAME_CP_RWSEM);
 	init_f2fs_rwsem(&sbi->quota_sem);
 	init_waitqueue_head(&sbi->cp_wait);
 	spin_lock_init(&sbi->error_lock);
@@ -5611,6 +5620,7 @@ free_sbi:
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 	lockdep_unregister_key(&sbi->cp_global_sem_key);
 #endif
+	free_percpu(sbi->cp_rwsem_pcpu);
 	kfree(sbi);
 	sb->s_fs_info = NULL;
 
@@ -5704,6 +5714,7 @@ static void kill_f2fs_super(struct super_block *sb)
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 		lockdep_unregister_key(&sbi->cp_global_sem_key);
 #endif
+		free_percpu(sbi->cp_rwsem_pcpu);
 		kfree(sbi);
 		sb->s_fs_info = NULL;
 	}

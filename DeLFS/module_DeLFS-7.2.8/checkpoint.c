@@ -201,9 +201,28 @@ void f2fs_up_write_trace(struct f2fs_rwsem *sem, struct f2fs_lock_context *lc)
 	trace_lock_elapsed_time_end(sem, lc, true);
 }
 
+/*
+ * DeLFS: cp_rwsem is one rwsem per CPU (sbi->cp_rwsem_pcpu).
+ *
+ * Writeback read-locks it for every page (f2fs_do_write_data_page()), so a
+ * single rwsem made every core do an atomic on the same cache line per page
+ * (lab2a, 128 cores: down_read_trylock + up_read ~7-11% of all CPU time).
+ * A reader takes the rwsem of the CPU it runs on and records that slot in
+ * lc->cp_cpu, so f2fs_unlock_op() releases the same one after a migration.
+ * The writer (checkpoint, block_operations()) takes every possible CPU's
+ * rwsem, which excludes all readers exactly as the single rwsem did.
+ * Callers already pass the same lc to lock and unlock (7.2.8 lock tracing).
+ */
+static inline struct f2fs_rwsem *cp_rwsem_slot(struct f2fs_sb_info *sbi,
+						int cpu)
+{
+	return per_cpu_ptr(sbi->cp_rwsem_pcpu, cpu);
+}
+
 void f2fs_lock_op(struct f2fs_sb_info *sbi, struct f2fs_lock_context *lc)
 {
-	f2fs_down_read_trace(&sbi->cp_rwsem, lc);
+	lc->cp_cpu = raw_smp_processor_id();
+	f2fs_down_read_trace(cp_rwsem_slot(sbi, lc->cp_cpu), lc);
 }
 
 int f2fs_trylock_op(struct f2fs_sb_info *sbi, struct f2fs_lock_context *lc)
@@ -211,22 +230,35 @@ int f2fs_trylock_op(struct f2fs_sb_info *sbi, struct f2fs_lock_context *lc)
 	if (time_to_inject(sbi, FAULT_LOCK_OP))
 		return 0;
 
-	return f2fs_down_read_trylock_trace(&sbi->cp_rwsem, lc);
+	lc->cp_cpu = raw_smp_processor_id();
+	return f2fs_down_read_trylock_trace(cp_rwsem_slot(sbi, lc->cp_cpu), lc);
 }
 
 void f2fs_unlock_op(struct f2fs_sb_info *sbi, struct f2fs_lock_context *lc)
 {
-	f2fs_up_read_trace(&sbi->cp_rwsem, lc);
+	f2fs_up_read_trace(cp_rwsem_slot(sbi, lc->cp_cpu), lc);
 }
 
+/*
+ * Every caller holds cp_global_sem for write (f2fs_write_checkpoint(), and
+ * f2fs_resize_fs() for CP_RESIZE), so lockdep may see the per-CPU rwsems,
+ * which share one class, nested under it.
+ */
 static inline void f2fs_lock_all(struct f2fs_sb_info *sbi)
 {
-	f2fs_down_write(&sbi->cp_rwsem);
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		down_write_nest_lock(&cp_rwsem_slot(sbi, cpu)->internal_rwsem,
+				     &sbi->cp_global_sem.internal_rwsem);
 }
 
 static inline void f2fs_unlock_all(struct f2fs_sb_info *sbi)
 {
-	f2fs_up_write(&sbi->cp_rwsem);
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		f2fs_up_write(cp_rwsem_slot(sbi, cpu));
 }
 
 #define DEFAULT_CHECKPOINT_IOPRIO (IOPRIO_PRIO_VALUE(IOPRIO_CLASS_RT, 3))

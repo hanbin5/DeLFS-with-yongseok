@@ -1503,6 +1503,7 @@ struct f2fs_lock_context {
 	int new_nice;
 	bool lock_trace;
 	bool need_restore;
+	int cp_cpu;		/* DeLFS: slot of sbi->cp_rwsem_pcpu taken */
 };
 
 struct f2fs_gc_control {
@@ -1873,7 +1874,13 @@ struct f2fs_sb_info {
 	spinlock_t cp_lock;			/* for flag in ckpt */
 	struct inode *meta_inode;		/* cache meta blocks */
 	struct f2fs_rwsem cp_global_sem;	/* checkpoint procedure lock */
-	struct f2fs_rwsem cp_rwsem;		/* blocking FS operations */
+	/*
+	 * DeLFS: blocking FS operations, one rwsem per CPU.  f2fs_lock_op()
+	 * read-locks the current CPU's and remembers it in lc->cp_cpu;
+	 * f2fs_lock_all() write-locks every possible CPU's.  A single rwsem
+	 * here was read-locked for every page written back, by every core.
+	 */
+	struct f2fs_rwsem __percpu *cp_rwsem_pcpu;
 	struct f2fs_rwsem node_write;		/* locking node writes */
 	struct f2fs_rwsem node_change;	/* locking node change */
 	wait_queue_head_t cp_wait;
@@ -2506,6 +2513,17 @@ static inline void do_init_f2fs_rwsem(struct f2fs_rwsem *sem,
 static inline int f2fs_rwsem_is_locked(struct f2fs_rwsem *sem)
 {
 	return rwsem_is_locked(&sem->internal_rwsem);
+}
+
+/* DeLFS: is any CPU's cp_rwsem held? Only for heuristics; racy, as before. */
+static inline bool f2fs_cp_rwsem_is_locked(struct f2fs_sb_info *sbi)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		if (f2fs_rwsem_is_locked(per_cpu_ptr(sbi->cp_rwsem_pcpu, cpu)))
+			return true;
+	return false;
 }
 
 static inline int f2fs_rwsem_is_contended(struct f2fs_rwsem *sem)
