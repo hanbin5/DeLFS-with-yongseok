@@ -5517,7 +5517,9 @@ out_unlock:
 	 *
 	 * Runs for any successful write: pure DIO normally leaves no dirty
 	 * pages, but this also covers DIO falling back to buffered write.
-	 * Skipped for IOCB_NOWAIT, which must not block.
+	 * Skipped for IOCB_NOWAIT, which must not block.  A recent "below the
+	 * background threshold" result is cached for a few jiffies; see
+	 * fs/fs-writeback.c.
 	 */
 	if (ret > 0 && !(iocb->ki_flags & IOCB_NOWAIT))
 		df_flush_deferred_writeback(inode->i_mapping);

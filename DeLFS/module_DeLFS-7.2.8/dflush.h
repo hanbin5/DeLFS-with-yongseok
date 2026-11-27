@@ -16,6 +16,12 @@
  *  2. df_flush_deferred_writeback() (after inode_unlock): if the wb is over
  *     the background threshold, the writer itself writes back up to
  *     DF_DEFERRED_WRITEBACK_PAGES (64MB) through df_wb_writeback().
+ *     This runs after every write(), whatever its size.  Only a "below the
+ *     threshold" result is cached, per CPU and for at most
+ *     DF_BG_BELOW_CACHE_JIFFIES; while it is valid the writer skips the wb
+ *     lookup and the check.  Over the threshold, every writer still does
+ *     the full check and the writeback (with approach B this is the
+ *     writer's only brake).
  *
  * Doing step 2 with i_rwsem held can deadlock or hang (writeback touches
  * other inodes and may run foreground GC), so the order matters.
