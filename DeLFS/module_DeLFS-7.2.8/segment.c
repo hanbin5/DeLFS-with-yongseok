@@ -2048,7 +2048,7 @@ static unsigned int __wait_discard_cmd_range(struct f2fs_sb_info *sbi,
 	struct discard_cmd *dc = NULL, *iter, *tmp;
 	unsigned int trimmed = 0;
 
-next:
+next:;
 	int dcc_cpu;
 	for_each_online_cpu(dcc_cpu) {
 		struct discard_set *ds = per_cpu_ptr(dcc->ds, dcc_cpu);
