@@ -198,7 +198,6 @@ static long df_wb_writeback(struct bdi_writeback *wb,
  */
 static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages)
 {
-	ktime_t stopwatch[2];
 	long wrote = 0;
 
 	if (nr_pages <= 0)
@@ -207,9 +206,8 @@ static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages)
 	if (atomic_inc_return(&wb->nr_threads) == 1)
 		set_bit(WB_writeback_running, &wb->state);
 
-	/* calclock: df_wb_check_background_flush() in 6.6.8 DeLFS */
-	ktget(&stopwatch[0]);
 	if (wb_over_bg_thresh(wb)) {
+		ktime_t stopwatch[2];
 		struct wb_writeback_work work = {
 			.nr_pages	= nr_pages,
 			.sync_mode	= WB_SYNC_NONE,
@@ -218,10 +216,17 @@ static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages)
 			.reason		= WB_REASON_BACKGROUND,
 		};
 
+		/*
+		 * calclock: time only real writer-assisted writeback.  In
+		 * 6.6.8 DeLFS the probes of this name sit on a path the async
+		 * write never reaches, so timing every poll here made each
+		 * write() pay two clock-read pairs the original does not.
+		 */
+		ktget(&stopwatch[0]);
 		wrote += df_wb_writeback(wb, &work);
+		ktget(&stopwatch[1]);
+		ktput(stopwatch, df_wb_check_background_flush);
 	}
-	ktget(&stopwatch[1]);
-	ktput(stopwatch, df_wb_check_background_flush);
 
 	if (atomic_dec_and_test(&wb->nr_threads))
 		clear_bit(WB_writeback_running, &wb->state);
@@ -237,7 +242,6 @@ KTDEC(df_wb_do_writeback);
 
 long df_flush_deferred_writeback(struct address_space *mapping)
 {
-	ktime_t stopwatch[2];
 	struct inode *inode;
 	struct backing_dev_info *bdi;
 	struct bdi_writeback *wb = NULL;
@@ -259,11 +263,8 @@ long df_flush_deferred_writeback(struct address_space *mapping)
 	if (!wb)
 		wb = &bdi->wb;
 
-	/* calclock: df_wb_do_writeback() call in 6.6.8 df_balance_dirty_pages() */
-	ktget(&stopwatch[0]);
+	/* not timed per poll: see df_wb_do_writeback_limited() */
 	wrote = df_wb_do_writeback_limited(wb, DF_DEFERRED_WRITEBACK_PAGES);
-	ktget(&stopwatch[1]);
-	ktput(stopwatch, df_wb_do_writeback);
 
 	wb_put(wb);
 	return wrote;
