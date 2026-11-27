@@ -1232,9 +1232,16 @@ struct f2fs_sm_info {
 	struct curseg_info *curseg_array;	/* active segment information */
 	struct curseg_info_array __percpu *wrap_curseg_array;	/* DeLFS: per-core active segment information */
 
-	struct f2fs_rwsem curseg_lock;	/* for preventing curseg change */
+	/*
+	 * DeLFS: every block allocation read-locks this, on all cores at once,
+	 * so its lock word changes all the time. It gets a cache line of its
+	 * own: the pointers above and the geometry below are only read on the
+	 * same path, and sharing a line with the lock made each of those reads
+	 * a cache miss on the other cores (false sharing).
+	 */
+	struct f2fs_rwsem curseg_lock ____cacheline_aligned_in_smp;	/* for preventing curseg change */
 
-	block_t seg0_blkaddr;		/* block address of 0'th segment */
+	block_t seg0_blkaddr ____cacheline_aligned_in_smp;	/* block address of 0'th segment */
 	block_t main_blkaddr;		/* start block address of main area */
 	block_t ssa_blkaddr;		/* start block address of SSA area */
 
@@ -1892,8 +1899,17 @@ struct f2fs_sb_info {
 
 	/* for extent tree cache */
 	struct extent_tree_info extent_tree[NR_EXTENT_CACHES];
-	atomic64_t allocated_data_blocks;	/* for block age extent_cache */
-	unsigned int max_read_extent_count;	/* max read extent count per inode */
+	/*
+	 * DeLFS: incremented for every data block allocated, by all per-CPU
+	 * logs at once. Upstream allocates under one lock, so there the place
+	 * of this counter does not matter; here it shared a cache line with the
+	 * geometry below (root_ino_num, log_blocks_per_seg, blocks_per_seg,
+	 * segs_per_sec, ...), which the write path reads many times per block.
+	 * Each increment then evicted that line from every other core. The
+	 * counter keeps its meaning; it only gets a cache line of its own.
+	 */
+	atomic64_t allocated_data_blocks ____cacheline_aligned_in_smp;	/* for block age extent_cache */
+	unsigned int max_read_extent_count ____cacheline_aligned_in_smp;	/* max read extent count per inode */
 
 	/* The threshold used for hot and warm data seperation*/
 	unsigned int hot_data_age_threshold;
@@ -1916,7 +1932,6 @@ struct f2fs_sb_info {
 	unsigned int secs_per_zone;		/* sections per zone */
 	unsigned int total_sections;		/* total section count */
 	unsigned int total_node_count;		/* total node block count */
-	unsigned int total_valid_node_count;	/* valid node block count */
 	int dir_level;				/* directory level */
 	bool readdir_ra;			/* readahead inode in readdir */
 	unsigned int max_io_bytes;		/* max io bytes to merge IOs */
@@ -1936,7 +1951,13 @@ struct f2fs_sb_info {
 	 * more than 2^31 blocks (8 TiB with 4 KiB blocks) would go negative.
 	 * Readers cast atomic_read() back to block_t to keep the u32 semantics.
 	 */
-	atomic_t user_block_count;		/* # of user blocks */
+	/*
+	 * DeLFS: the counters from here on change while blocks and nodes are
+	 * allocated, so they start a new cache line and total_valid_node_count
+	 * sits with them instead of among the read-mostly units above.
+	 */
+	atomic_t user_block_count ____cacheline_aligned_in_smp;	/* # of user blocks */
+	unsigned int total_valid_node_count;	/* valid node block count */
 	atomic_t total_valid_block_count;	/* # of valid blocks */
 	atomic_t discard_blks;			/* discard command candidats */
 	atomic_t last_valid_block_count;	/* for recovery */
@@ -1950,10 +1971,10 @@ struct f2fs_sb_info {
 	struct f2fs_rwsem quota_sem;		/* blocking cp for flags */
 	struct task_struct *umount_lock_holder;	/* s_umount lock holder */
 
-	/* # of pages, see count_type */
-	atomic_t nr_pages[NR_COUNT_TYPE];
+	/* # of pages, see count_type (changed for every page dirtied or written) */
+	atomic_t nr_pages[NR_COUNT_TYPE] ____cacheline_aligned_in_smp;
 	/* # of allocated blocks */
-	struct percpu_counter alloc_valid_block_count;
+	struct percpu_counter alloc_valid_block_count ____cacheline_aligned_in_smp;
 	/* # of node block writes as roll forward recovery */
 	struct percpu_counter rf_node_block_count;
 

@@ -235,7 +235,6 @@ struct revoke_entry {
 struct sit_info {
 	block_t sit_base_addr;		/* start block address of SIT area */
 	block_t sit_blocks;		/* # of blocks used by SIT area */
-	atomic64_t written_valid_blocks;	/* # of valid blocks in main area (DeLFS: atomic) */
 	char *bitmap;			/* all bitmaps pointer */
 	char *sit_bitmap;		/* SIT bitmap pointer */
 #ifdef CONFIG_F2FS_CHECK_FS
@@ -246,7 +245,6 @@ struct sit_info {
 
 	unsigned long *tmp_map;			/* bitmap for temporal use */
 	unsigned long *dirty_sentries_bitmap;	/* bitmap for dirty sentries */
-	atomic_t dirty_sentries;		/* # of dirty sentries (DeLFS: atomic) */
 	unsigned int sents_per_block;		/* # of SIT entries per block */
 	/*
 	 * DeLFS deSIT: one SIT lock per core region instead of the global
@@ -267,15 +265,28 @@ struct sit_info {
 	unsigned long long dirty_max_mtime;	/* rerange candidates in GC_AT */
 
 	unsigned int last_victim[MAX_GC_POLICY]; /* last victim segment # */
+
+	/*
+	 * DeLFS: these two change for every block that is allocated or
+	 * invalidated, on every core. They sit on a cache line of their own so
+	 * that those writes do not evict the pointers above from the other
+	 * cores, which read them on the same path.
+	 */
+	atomic64_t written_valid_blocks ____cacheline_aligned_in_smp;	/* # of valid blocks in main area (DeLFS: atomic) */
+	atomic_t dirty_sentries;		/* # of dirty sentries (DeLFS: atomic) */
 };
 
 struct free_segmap_info {
 	unsigned int start_segno;	/* start segment number logically */
-	unsigned int free_segments;	/* # of free segments */
-	unsigned int free_sections;	/* # of free sections */
-	spinlock_t segmap_lock;		/* free segmap lock */
 	unsigned long *free_segmap;	/* free segment bitmap */
 	unsigned long *free_secmap;	/* free section bitmap */
+	/*
+	 * DeLFS: the lock and the counters change whenever any core takes or
+	 * frees a segment; start_segno above is read by every GET_SEGNO().
+	 */
+	spinlock_t segmap_lock ____cacheline_aligned_in_smp;	/* free segmap lock */
+	unsigned int free_segments;	/* # of free segments */
+	unsigned int free_sections;	/* # of free sections */
 };
 
 /* Notice: The order of dirty type is same with CURSEG_XXX in f2fs.h */
@@ -301,11 +312,12 @@ struct dirty_seg_percpu {
 
 struct dirty_seglist_info {
 	struct dirty_seg_percpu __percpu *pcpu;	/* DeLFS: per core region */
-	atomic_t nr_dirty[NR_DIRTY_TYPE];	/* # of dirty segments, all regions */
 	unsigned long *victim_secmap;		/* background GC victims */
 	unsigned long *pinned_secmap;		/* pinned victims from foreground GC */
 	unsigned int pinned_secmap_cnt;		/* count of victims which has pinned data */
 	bool enable_pin_section;		/* enable pinning section */
+	/* DeLFS: written by every core; kept off the line of the pcpu pointer */
+	atomic_t nr_dirty[NR_DIRTY_TYPE] ____cacheline_aligned_in_smp;	/* # of dirty segments, all regions */
 };
 
 void f2fs_remove_dirty_segment_locked(struct f2fs_sb_info *sbi,
