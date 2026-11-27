@@ -841,7 +841,26 @@ static void __update_extent_tree_range(struct inode *inode,
 	if (tei->blk) {
 		__set_extent_info(&ei, fofs, len, tei->blk, false,
 				  0, 0, EX_READ);
-		if (!__try_merge_extent_node(sbi, et, &ei, prev_en, next_en))
+		/*
+		 * DeLFS: a tree that already holds max_read_extent_count nodes
+		 * does not take a new one here either.
+		 *
+		 * Upstream checks that limit only where an extent is split
+		 * (above); it was added because a tree with a huge number of
+		 * nodes takes very long to shrink. Blocks written for the first
+		 * time in random order never split anything: each one adds a
+		 * single-block node here. With many writers at once that left
+		 * tens of millions of nodes, and a task entering direct reclaim
+		 * then freed them one at a time in the shrinker, for many
+		 * seconds.
+		 *
+		 * A full tree keeps its nodes and still merges into them; only a
+		 * mapping that would need a new node is not cached. Lookups for
+		 * it fall back to the node page, as they do after any shrink.
+		 */
+		if (!__try_merge_extent_node(sbi, et, &ei, prev_en, next_en) &&
+				atomic_read(&et->node_cnt) <
+					sbi->max_read_extent_count)
 			__insert_extent_tree(sbi, et, &ei,
 					insert_p, insert_parent, leftmost);
 
