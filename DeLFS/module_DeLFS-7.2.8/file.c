@@ -72,8 +72,44 @@ static int do_zero_post_eof_page(struct inode *inode, loff_t new_size)
 				old_size, old_size + len - 1);
 }
 
-static int f2fs_zero_post_eof_page(struct inode *inode,
-					loff_t new_size, bool lock, bool writeback)
+static loff_t skip_zero_writeback_tail(struct inode *inode, loff_t pos, loff_t end)
+{
+	struct address_space *mapping = inode->i_mapping;
+	unsigned int off = offset_in_page(pos);
+	size_t len = min_t(loff_t, PAGE_SIZE - off, end - pos);
+	struct folio *folio;
+
+	if (!off || !mapping_tagged(mapping, PAGECACHE_TAG_WRITEBACK) ||
+	    f2fs_is_mmap_file(inode) || f2fs_is_atomic_file(inode) ||
+	    f2fs_compressed_file(inode) || f2fs_has_inline_data(inode) ||
+	    IS_ENCRYPTED(inode) || mapping_large_folio_support(mapping))
+		return pos;
+
+	folio = __filemap_get_folio(mapping, pos >> PAGE_SHIFT,
+				    FGP_LOCK | FGP_NOWAIT, 0);
+	if (IS_ERR(folio))
+		return pos;
+	/*
+	 * Partial invalidation of an ordinary data folio is a no-op for
+	 * F2FS. If the requested bytes already are zero, no store or DMA
+	 * wait is needed. Never skip any subsequent pages in the range.
+	 */
+	if (folio_test_writeback(folio) && folio_test_uptodate(folio) &&
+	    !folio_test_large(folio) && !folio_test_hwpoison(folio) &&
+	    !folio_mapped(folio)) {
+		void *p = kmap_local_folio(folio, off);
+
+		if (!memchr_inv(p, 0, len))
+			pos += len;
+		kunmap_local(p);
+	}
+	folio_unlock(folio);
+	folio_put(folio);
+	return pos;
+}
+
+static int __f2fs_zero_post_eof_page(struct inode *inode,
+			loff_t new_size, bool lock, bool writeback, bool append)
 {
 	loff_t old_size = i_size_read(inode);
 	bool strict =
@@ -88,7 +124,10 @@ static int f2fs_zero_post_eof_page(struct inode *inode,
 	if (lock)
 		filemap_invalidate_lock(inode->i_mapping);
 	/* zero or drop pages only in range of [old_size, new_size] */
-	truncate_inode_pages_range(inode->i_mapping, old_size, new_size - 1);
+	if (append && !strict)
+		old_size = skip_zero_writeback_tail(inode, old_size, new_size);
+	if (old_size < new_size)
+		truncate_inode_pages_range(inode->i_mapping, old_size, new_size - 1);
 	if (lock)
 		filemap_invalidate_unlock(inode->i_mapping);
 
@@ -101,6 +140,12 @@ static int f2fs_zero_post_eof_page(struct inode *inode,
 	 * and POR.
 	 */
 	return do_zero_post_eof_page(inode, new_size);
+}
+
+static int f2fs_zero_post_eof_page(struct inode *inode, loff_t new_size,
+				   bool lock, bool writeback)
+{
+	return __f2fs_zero_post_eof_page(inode, new_size, lock, writeback, false);
 }
 
 static vm_fault_t f2fs_filemap_fault(struct vm_fault *vmf)
@@ -5093,8 +5138,9 @@ static ssize_t f2fs_write_checks(struct kiocb *iocb, struct iov_iter *from)
 	if (err)
 		return err;
 
-	err = f2fs_zero_post_eof_page(inode,
-		iocb->ki_pos + iov_iter_count(from), true, true);
+	err = __f2fs_zero_post_eof_page(inode, iocb->ki_pos + iov_iter_count(from),
+		true, true, !(iocb->ki_flags & IOCB_DIRECT) &&
+		iocb->ki_pos == i_size_read(inode));
 	if (err)
 		return err;
 	return count;
