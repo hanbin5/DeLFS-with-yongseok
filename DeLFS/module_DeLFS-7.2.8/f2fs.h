@@ -221,6 +221,33 @@ struct f2fs_rwsem {
 #endif
 };
 
+/*
+ * DeLFS: a reader-writer semaphore with one f2fs_rwsem per CPU.
+ *
+ * cp_rwsem is taken for read once for every data page written back, and
+ * node_change once for every buffered write().  A single rw_semaphore keeps
+ * its reader count in one word, so each of those lock/unlock pairs writes
+ * the same cache line from every core.  Here a reader locks only the
+ * semaphore of the CPU it runs on, and a writer (checkpoint) locks all of
+ * them.  Readers on different CPUs then share nothing.
+ *
+ * A reader records the CPU in its f2fs_lock_context and unlocks that same
+ * semaphore, on whatever CPU it runs by then.  Everything else (blocking,
+ * trylock, wake-up order, lock tracing, priority uplift) is the f2fs_rwsem
+ * behaviour of that one semaphore.
+ *
+ * @writers is non-zero from the moment a writer starts taking the
+ * semaphores until it has released them.  Readers look at it first:
+ * a trylock fails, and a blocking reader lines up at the first semaphore
+ * the writer takes.  So a writer waits only for readers that were already
+ * inside, as with a single rw_semaphore, and not once per CPU for readers
+ * that keep arriving.
+ */
+struct f2fs_pcpu_rwsem {
+	struct f2fs_rwsem __percpu *sem;
+	atomic_t writers;
+};
+
 struct f2fs_mount_info {
 	unsigned long long opt;
 	block_t root_reserved_blocks;	/* root reserved blocks */
@@ -1531,6 +1558,7 @@ struct f2fs_lock_context {
 	struct f2fs_time_stat ts;
 	int orig_nice;
 	int new_nice;
+	int cpu;	/* DeLFS: f2fs_pcpu_rwsem, whose semaphore a reader holds */
 	bool lock_trace;
 	bool need_restore;
 };
@@ -1903,9 +1931,7 @@ struct f2fs_sb_info {
 	spinlock_t cp_lock;			/* for flag in ckpt */
 	struct inode *meta_inode;		/* cache meta blocks */
 	struct f2fs_rwsem cp_global_sem;	/* checkpoint procedure lock */
-	struct f2fs_rwsem cp_rwsem;		/* blocking FS operations */
 	struct f2fs_rwsem node_write;		/* locking node writes */
-	struct f2fs_rwsem node_change;	/* locking node change */
 	wait_queue_head_t cp_wait;
 	unsigned long last_time[MAX_TIME];	/* to store time in jiffies */
 	long interval_time[MAX_TIME];		/* to store thresholds */
@@ -1947,6 +1973,14 @@ struct f2fs_sb_info {
 	 */
 	struct f2fs_pcpu_cnt __percpu *pcpu_cnt ____cacheline_aligned_in_smp;
 	bool pcpu_dirty_data;			/* F2FS_DIRTY_DATA is per CPU */
+	/*
+	 * DeLFS: cp_rwsem and node_change are per-CPU semaphores (see struct
+	 * f2fs_pcpu_rwsem).  What is stored here is read by every reader and
+	 * written only by a checkpoint, so it is kept away from node_write
+	 * and cp_wait, which it used to sit between.
+	 */
+	struct f2fs_pcpu_rwsem cp_rwsem;	/* blocking FS operations */
+	struct f2fs_pcpu_rwsem node_change;	/* locking node change */
 	unsigned int max_read_extent_count;	/* max read extent count per inode */
 
 	/* The threshold used for hot and warm data seperation*/
@@ -2622,6 +2656,18 @@ void f2fs_down_write_trace(struct f2fs_rwsem *sem,
 int f2fs_down_write_trylock_trace(struct f2fs_rwsem *sem,
 						struct f2fs_lock_context *lc);
 void f2fs_up_write_trace(struct f2fs_rwsem *sem, struct f2fs_lock_context *lc);
+
+/* DeLFS: per-CPU reader-writer semaphore, see struct f2fs_pcpu_rwsem */
+void f2fs_pcpu_down_read_trace(struct f2fs_pcpu_rwsem *ps,
+						struct f2fs_lock_context *lc);
+int f2fs_pcpu_down_read_trylock_trace(struct f2fs_pcpu_rwsem *ps,
+						struct f2fs_lock_context *lc);
+void f2fs_pcpu_up_read_trace(struct f2fs_pcpu_rwsem *ps,
+						struct f2fs_lock_context *lc);
+void f2fs_pcpu_down_write(struct f2fs_pcpu_rwsem *ps,
+						struct f2fs_rwsem *nest_lock);
+void f2fs_pcpu_up_write(struct f2fs_pcpu_rwsem *ps);
+bool f2fs_pcpu_rwsem_is_locked(struct f2fs_pcpu_rwsem *ps);
 
 static inline void disable_nat_bits(struct f2fs_sb_info *sbi, bool lock)
 {

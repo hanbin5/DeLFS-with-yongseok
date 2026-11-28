@@ -1994,6 +1994,10 @@ static void destroy_percpu_info(struct f2fs_sb_info *sbi)
 	percpu_counter_destroy(&sbi->total_valid_inode_count);
 	percpu_counter_destroy(&sbi->rf_node_block_count);
 	percpu_counter_destroy(&sbi->alloc_valid_block_count);
+	free_percpu(sbi->node_change.sem);
+	sbi->node_change.sem = NULL;
+	free_percpu(sbi->cp_rwsem.sem);
+	sbi->cp_rwsem.sem = NULL;
 	free_percpu(sbi->pcpu_cnt);
 	sbi->pcpu_cnt = NULL;
 }
@@ -4537,6 +4541,24 @@ static void init_sb_info(struct f2fs_sb_info *sbi)
 	init_f2fs_rwsem(&sbi->pin_sem);
 }
 
+/*
+ * DeLFS: one f2fs_rwsem per possible CPU (see struct f2fs_pcpu_rwsem).  A
+ * macro, so that each lock gets the lock class of its own call site, as
+ * init_f2fs_rwsem_trace() does for a single semaphore.
+ */
+#define init_f2fs_pcpu_rwsem(ps, sbi, name)				\
+({									\
+	int __cpu;							\
+									\
+	atomic_set(&(ps)->writers, 0);					\
+	(ps)->sem = alloc_percpu(struct f2fs_rwsem);			\
+	if ((ps)->sem)							\
+		for_each_possible_cpu(__cpu)				\
+			init_f2fs_rwsem_trace(per_cpu_ptr((ps)->sem,	\
+						__cpu), sbi, name);	\
+	(ps)->sem ? 0 : -ENOMEM;					\
+})
+
 static int init_percpu_info(struct f2fs_sb_info *sbi)
 {
 	int err;
@@ -4550,9 +4572,18 @@ static int init_percpu_info(struct f2fs_sb_info *sbi)
 		return -ENOMEM;
 	sbi->pcpu_dirty_data = !f2fs_lfs_mode(sbi);
 
-	err = percpu_counter_init(&sbi->alloc_valid_block_count, 0, GFP_KERNEL);
+	/* DeLFS: per-CPU cp_rwsem and node_change; nothing locks them yet */
+	err = init_f2fs_pcpu_rwsem(&sbi->cp_rwsem, sbi, LOCK_NAME_CP_RWSEM);
 	if (err)
 		goto err_pcpu_cnt;
+	err = init_f2fs_pcpu_rwsem(&sbi->node_change, sbi,
+						LOCK_NAME_NODE_CHANGE);
+	if (err)
+		goto err_cp_rwsem;
+
+	err = percpu_counter_init(&sbi->alloc_valid_block_count, 0, GFP_KERNEL);
+	if (err)
+		goto err_node_change;
 
 	err = percpu_counter_init(&sbi->rf_node_block_count, 0, GFP_KERNEL);
 	if (err)
@@ -4568,6 +4599,12 @@ err_node_block:
 	percpu_counter_destroy(&sbi->rf_node_block_count);
 err_valid_block:
 	percpu_counter_destroy(&sbi->alloc_valid_block_count);
+err_node_change:
+	free_percpu(sbi->node_change.sem);
+	sbi->node_change.sem = NULL;
+err_cp_rwsem:
+	free_percpu(sbi->cp_rwsem.sem);
+	sbi->cp_rwsem.sem = NULL;
 err_pcpu_cnt:
 	free_percpu(sbi->pcpu_cnt);
 	sbi->pcpu_cnt = NULL;
@@ -5175,9 +5212,8 @@ try_onemore:
 					&sbi->cp_global_sem_key);
 #endif
 	init_f2fs_rwsem_trace(&sbi->node_write, sbi, LOCK_NAME_NODE_WRITE);
-	init_f2fs_rwsem_trace(&sbi->node_change, sbi, LOCK_NAME_NODE_CHANGE);
 	spin_lock_init(&sbi->stat_lock);
-	init_f2fs_rwsem_trace(&sbi->cp_rwsem, sbi, LOCK_NAME_CP_RWSEM);
+	/* DeLFS: cp_rwsem and node_change are set up in init_percpu_info() */
 	init_f2fs_rwsem(&sbi->quota_sem);
 	init_waitqueue_head(&sbi->cp_wait);
 	spin_lock_init(&sbi->error_lock);

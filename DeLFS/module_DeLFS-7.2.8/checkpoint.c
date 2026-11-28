@@ -201,9 +201,91 @@ void f2fs_up_write_trace(struct f2fs_rwsem *sem, struct f2fs_lock_context *lc)
 	trace_lock_elapsed_time_end(sem, lc, true);
 }
 
+/*
+ * DeLFS: per-CPU reader-writer semaphore, see struct f2fs_pcpu_rwsem.
+ */
+static inline struct f2fs_rwsem *pcpu_rwsem_of(struct f2fs_pcpu_rwsem *ps,
+								int cpu)
+{
+	return per_cpu_ptr(ps->sem, cpu);
+}
+
+void f2fs_pcpu_down_read_trace(struct f2fs_pcpu_rwsem *ps,
+						struct f2fs_lock_context *lc)
+{
+	/*
+	 * The task may move to another CPU right after this; it then only
+	 * locks a semaphore that is not the one of its CPU, which is fine.
+	 * With a writer on its way, wait at the semaphore the writer takes
+	 * first instead of entering one it has not reached yet.
+	 */
+	if (unlikely(atomic_read(&ps->writers)))
+		lc->cpu = cpumask_first(cpu_possible_mask);
+	else
+		lc->cpu = raw_smp_processor_id();
+
+	f2fs_down_read_trace(pcpu_rwsem_of(ps, lc->cpu), lc);
+}
+
+int f2fs_pcpu_down_read_trylock_trace(struct f2fs_pcpu_rwsem *ps,
+						struct f2fs_lock_context *lc)
+{
+	/* a writer holds the lock or is waiting for readers to leave */
+	if (unlikely(atomic_read(&ps->writers)))
+		return 0;
+
+	lc->cpu = raw_smp_processor_id();
+	return f2fs_down_read_trylock_trace(pcpu_rwsem_of(ps, lc->cpu), lc);
+}
+
+void f2fs_pcpu_up_read_trace(struct f2fs_pcpu_rwsem *ps,
+						struct f2fs_lock_context *lc)
+{
+	f2fs_up_read_trace(pcpu_rwsem_of(ps, lc->cpu), lc);
+}
+
+/*
+ * Writers take every CPU's semaphore, lowest CPU first.  @nest_lock is a
+ * lock all writers of @ps hold (cp_global_sem), which is what makes taking
+ * many semaphores of one class safe; it is only used by lockdep.
+ */
+void f2fs_pcpu_down_write(struct f2fs_pcpu_rwsem *ps,
+						struct f2fs_rwsem *nest_lock)
+{
+	int cpu;
+
+	atomic_inc(&ps->writers);
+	for_each_possible_cpu(cpu)
+		down_write_nest_lock(&pcpu_rwsem_of(ps, cpu)->internal_rwsem,
+						&nest_lock->internal_rwsem);
+}
+
+void f2fs_pcpu_up_write(struct f2fs_pcpu_rwsem *ps)
+{
+	int cpu;
+
+	atomic_dec(&ps->writers);
+	for_each_possible_cpu(cpu)
+		f2fs_up_write(pcpu_rwsem_of(ps, cpu));
+}
+
+/* true while any reader or a writer is inside, like rwsem_is_locked() */
+bool f2fs_pcpu_rwsem_is_locked(struct f2fs_pcpu_rwsem *ps)
+{
+	int cpu;
+
+	if (atomic_read(&ps->writers))
+		return true;
+
+	for_each_possible_cpu(cpu)
+		if (f2fs_rwsem_is_locked(pcpu_rwsem_of(ps, cpu)))
+			return true;
+	return false;
+}
+
 void f2fs_lock_op(struct f2fs_sb_info *sbi, struct f2fs_lock_context *lc)
 {
-	f2fs_down_read_trace(&sbi->cp_rwsem, lc);
+	f2fs_pcpu_down_read_trace(&sbi->cp_rwsem, lc);
 }
 
 int f2fs_trylock_op(struct f2fs_sb_info *sbi, struct f2fs_lock_context *lc)
@@ -211,22 +293,23 @@ int f2fs_trylock_op(struct f2fs_sb_info *sbi, struct f2fs_lock_context *lc)
 	if (time_to_inject(sbi, FAULT_LOCK_OP))
 		return 0;
 
-	return f2fs_down_read_trylock_trace(&sbi->cp_rwsem, lc);
+	return f2fs_pcpu_down_read_trylock_trace(&sbi->cp_rwsem, lc);
 }
 
 void f2fs_unlock_op(struct f2fs_sb_info *sbi, struct f2fs_lock_context *lc)
 {
-	f2fs_up_read_trace(&sbi->cp_rwsem, lc);
+	f2fs_pcpu_up_read_trace(&sbi->cp_rwsem, lc);
 }
 
+/* callers hold cp_global_sem (f2fs_write_checkpoint()) */
 static inline void f2fs_lock_all(struct f2fs_sb_info *sbi)
 {
-	f2fs_down_write(&sbi->cp_rwsem);
+	f2fs_pcpu_down_write(&sbi->cp_rwsem, &sbi->cp_global_sem);
 }
 
 static inline void f2fs_unlock_all(struct f2fs_sb_info *sbi)
 {
-	f2fs_up_write(&sbi->cp_rwsem);
+	f2fs_pcpu_up_write(&sbi->cp_rwsem);
 }
 
 #define DEFAULT_CHECKPOINT_IOPRIO (IOPRIO_PRIO_VALUE(IOPRIO_CLASS_RT, 3))
@@ -1518,10 +1601,10 @@ retry_flush_dents:
 	 * POR: we should ensure that there are no dirty node pages
 	 * until finishing nat/sit flush. inode->i_blocks can be updated.
 	 */
-	f2fs_down_write(&sbi->node_change);
+	f2fs_pcpu_down_write(&sbi->node_change, &sbi->cp_global_sem);
 
 	if (get_pages(sbi, F2FS_DIRTY_IMETA)) {
-		f2fs_up_write(&sbi->node_change);
+		f2fs_pcpu_up_write(&sbi->node_change);
 		f2fs_unlock_all(sbi);
 		err = f2fs_sync_inode_meta(sbi);
 		if (err)
@@ -1539,7 +1622,7 @@ retry_flush_nodes:
 		err = f2fs_sync_node_pages(sbi, &wbc, false, FS_CP_NODE_IO);
 		atomic_dec(&sbi->wb_sync_req[NODE]);
 		if (err) {
-			f2fs_up_write(&sbi->node_change);
+			f2fs_pcpu_up_write(&sbi->node_change);
 			f2fs_unlock_all(sbi);
 			return err;
 		}
@@ -1552,7 +1635,7 @@ retry_flush_nodes:
 	 * dirty node blocks and some checkpoint values by block allocation.
 	 */
 	__prepare_cp_block(sbi);
-	f2fs_up_write(&sbi->node_change);
+	f2fs_pcpu_up_write(&sbi->node_change);
 	return err;
 }
 

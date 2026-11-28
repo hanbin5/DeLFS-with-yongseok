@@ -645,7 +645,7 @@ void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
 
 static inline bool excess_dirty_threshold(struct f2fs_sb_info *sbi)
 {
-	int factor = f2fs_rwsem_is_locked(&sbi->cp_rwsem) ? 3 : 2;
+	int factor = f2fs_pcpu_rwsem_is_locked(&sbi->cp_rwsem) ? 3 : 2;
 	unsigned int dents = get_pages(sbi, F2FS_DIRTY_DENTS);
 	unsigned int qdata = get_pages(sbi, F2FS_DIRTY_QDATA);
 	unsigned int nodes = get_pages(sbi, F2FS_DIRTY_NODES);
@@ -700,7 +700,7 @@ void f2fs_balance_fs_bg(struct f2fs_sb_info *sbi, bool from_bg)
 
 	/* there is background inflight IO or foreground operation recently */
 	if (is_inflight_io(sbi, REQ_TIME) ||
-		(!f2fs_time_over(sbi, REQ_TIME) && f2fs_rwsem_is_locked(&sbi->cp_rwsem)))
+		(!f2fs_time_over(sbi, REQ_TIME) && f2fs_pcpu_rwsem_is_locked(&sbi->cp_rwsem)))
 		return;
 
 	/* exceed periodical checkpoint timeout threshold */
