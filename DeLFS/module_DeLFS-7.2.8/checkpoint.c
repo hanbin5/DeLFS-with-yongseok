@@ -210,21 +210,36 @@ static inline struct f2fs_rwsem *pcpu_rwsem_of(struct f2fs_pcpu_rwsem *ps,
 	return per_cpu_ptr(ps->sem, cpu);
 }
 
+/*
+ * Which semaphore a blocking reader takes.  The task may move to another
+ * CPU right after this; it then only locks a semaphore that is not the one
+ * of its CPU, which is fine.  With a writer on its way, wait at the
+ * semaphore the writer takes first instead of entering one it has not
+ * reached yet.
+ */
+static inline int pcpu_rwsem_reader_cpu(struct f2fs_pcpu_rwsem *ps)
+{
+	if (unlikely(atomic_read(&ps->writers)))
+		return cpumask_first(cpu_possible_mask);
+	return raw_smp_processor_id();
+}
+
 void f2fs_pcpu_down_read_trace(struct f2fs_pcpu_rwsem *ps,
 						struct f2fs_lock_context *lc)
 {
-	/*
-	 * The task may move to another CPU right after this; it then only
-	 * locks a semaphore that is not the one of its CPU, which is fine.
-	 * With a writer on its way, wait at the semaphore the writer takes
-	 * first instead of entering one it has not reached yet.
-	 */
-	if (unlikely(atomic_read(&ps->writers)))
-		lc->cpu = cpumask_first(cpu_possible_mask);
-	else
-		lc->cpu = raw_smp_processor_id();
-
+	lc->cpu = pcpu_rwsem_reader_cpu(ps);
 	f2fs_down_read_trace(pcpu_rwsem_of(ps, lc->cpu), lc);
+}
+
+void f2fs_pcpu_down_read(struct f2fs_pcpu_rwsem *ps, int *cpu)
+{
+	*cpu = pcpu_rwsem_reader_cpu(ps);
+	f2fs_down_read(pcpu_rwsem_of(ps, *cpu));
+}
+
+void f2fs_pcpu_up_read(struct f2fs_pcpu_rwsem *ps, int cpu)
+{
+	f2fs_up_read(pcpu_rwsem_of(ps, cpu));
 }
 
 int f2fs_pcpu_down_read_trylock_trace(struct f2fs_pcpu_rwsem *ps,
@@ -245,9 +260,11 @@ void f2fs_pcpu_up_read_trace(struct f2fs_pcpu_rwsem *ps,
 }
 
 /*
- * Writers take every CPU's semaphore, lowest CPU first.  @nest_lock is a
- * lock all writers of @ps hold (cp_global_sem), which is what makes taking
- * many semaphores of one class safe; it is only used by lockdep.
+ * Writers take every CPU's semaphore, lowest CPU first, so two writers
+ * cannot deadlock.  @nest_lock, if not NULL, is a lock all writers of @ps
+ * hold (cp_global_sem for cp_rwsem and node_change); it only tells lockdep
+ * that taking many semaphores of one class is safe.  curseg_lock has no
+ * such outer lock: lockdep would need a class per CPU there (not done).
  */
 void f2fs_pcpu_down_write(struct f2fs_pcpu_rwsem *ps,
 						struct f2fs_rwsem *nest_lock)
@@ -255,9 +272,15 @@ void f2fs_pcpu_down_write(struct f2fs_pcpu_rwsem *ps,
 	int cpu;
 
 	atomic_inc(&ps->writers);
-	for_each_possible_cpu(cpu)
-		down_write_nest_lock(&pcpu_rwsem_of(ps, cpu)->internal_rwsem,
-						&nest_lock->internal_rwsem);
+	for_each_possible_cpu(cpu) {
+		struct rw_semaphore *sem =
+				&pcpu_rwsem_of(ps, cpu)->internal_rwsem;
+
+		if (nest_lock)
+			down_write_nest_lock(sem, &nest_lock->internal_rwsem);
+		else
+			down_write(sem);
+	}
 }
 
 void f2fs_pcpu_up_write(struct f2fs_pcpu_rwsem *ps)
@@ -2068,7 +2091,7 @@ static int f2fs_write_checkpoint_internal(struct f2fs_sb_info *sbi, struct cp_co
 
 	if (!is_sbi_flag_set(sbi, SBI_IS_DIRTY) &&
 		((cpc->reason & CP_FASTBOOT) || (cpc->reason & CP_SYNC) ||
-		((cpc->reason & CP_DISCARD) && !(block_t)atomic_read(&sbi->discard_blks))))
+		((cpc->reason & CP_DISCARD) && !f2fs_discard_blks(sbi))))
 		goto out;
 	if (unlikely(f2fs_cp_error(sbi))) {
 		err = -EIO;

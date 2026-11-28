@@ -1989,6 +1989,43 @@ unsigned long long f2fs_allocated_data_blocks(struct f2fs_sb_info *sbi)
 	return sum;
 }
 
+/*
+ * DeLFS: fs-wide values of the counters update_sit_entry() keeps per CPU
+ * (see struct f2fs_pcpu_cnt).  Exact when no block is being allocated or
+ * invalidated; otherwise off by the updates in flight, so clamp at 0.
+ */
+block_t f2fs_written_block_count(struct f2fs_sb_info *sbi)
+{
+	s64 sum = atomic64_read(&SIT_I(sbi)->written_valid_blocks);
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += READ_ONCE(per_cpu_ptr(sbi->pcpu_cnt,
+					cpu)->written_valid_blocks);
+	return (block_t)max_t(s64, sum, 0);
+}
+
+block_t f2fs_discard_blks(struct f2fs_sb_info *sbi)
+{
+	s64 sum = atomic_read(&sbi->discard_blks);
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += READ_ONCE(per_cpu_ptr(sbi->pcpu_cnt, cpu)->discard_blks);
+	return (block_t)max_t(s64, sum, 0);
+}
+
+unsigned long f2fs_stat_block_count(struct f2fs_sb_info *sbi, int alloc_type)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += READ_ONCE(per_cpu_ptr(sbi->pcpu_cnt,
+					cpu)->block_count[alloc_type]);
+	return sum;
+}
+
 static void destroy_percpu_info(struct f2fs_sb_info *sbi)
 {
 	percpu_counter_destroy(&sbi->total_valid_inode_count);
@@ -2053,7 +2090,7 @@ static void f2fs_put_super(struct super_block *sb)
 
 	/* be sure to wait for any on-going discard commands */
 	done = f2fs_issue_discard_timeout(sbi, true);
-	if (f2fs_realtime_discard_enable(sbi) && !(block_t)atomic_read(&sbi->discard_blks) && done) {
+	if (f2fs_realtime_discard_enable(sbi) && !f2fs_discard_blks(sbi) && done) {
 		struct cp_control cpc = {
 			.reason = CP_UMOUNT | CP_TRIMMED,
 		};
@@ -4540,24 +4577,6 @@ static void init_sb_info(struct f2fs_sb_info *sbi)
 	init_f2fs_rwsem(&sbi->sb_lock);
 	init_f2fs_rwsem(&sbi->pin_sem);
 }
-
-/*
- * DeLFS: one f2fs_rwsem per possible CPU (see struct f2fs_pcpu_rwsem).  A
- * macro, so that each lock gets the lock class of its own call site, as
- * init_f2fs_rwsem_trace() does for a single semaphore.
- */
-#define init_f2fs_pcpu_rwsem(ps, sbi, name)				\
-({									\
-	int __cpu;							\
-									\
-	atomic_set(&(ps)->writers, 0);					\
-	(ps)->sem = alloc_percpu(struct f2fs_rwsem);			\
-	if ((ps)->sem)							\
-		for_each_possible_cpu(__cpu)				\
-			init_f2fs_rwsem_trace(per_cpu_ptr((ps)->sem,	\
-						__cpu), sbi, name);	\
-	(ps)->sem ? 0 : -ENOMEM;					\
-})
 
 static int init_percpu_info(struct f2fs_sb_info *sbi)
 {

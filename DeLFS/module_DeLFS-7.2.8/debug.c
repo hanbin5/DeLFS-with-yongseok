@@ -299,7 +299,7 @@ static void update_general_status(struct f2fs_sb_info *sbi)
 
 	for (i = 0; i < 2; i++) {
 		si->segment_count[i] = sbi->segment_count[i];
-		si->block_count[i] = sbi->block_count[i];
+		si->block_count[i] = f2fs_stat_block_count(sbi, i);
 	}
 
 	si->inplace_count = atomic_read(&sbi->inplace_count);

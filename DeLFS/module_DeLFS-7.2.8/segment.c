@@ -2338,7 +2338,7 @@ static int f2fs_issue_discard(struct f2fs_sb_info *sbi,
 
 		if (f2fs_block_unit_discard(sbi) &&
 				!f2fs_test_and_set_bit(offset, se->discard_map))
-			atomic_sub(1, &sbi->discard_blks);
+			this_cpu_dec(sbi->pcpu_cnt->discard_blks);	/* DeLFS */
 	}
 
 	if (len)
@@ -2797,7 +2797,7 @@ static int update_sit_entry_for_release(struct f2fs_sb_info *sbi, struct seg_ent
 
 		if (f2fs_block_unit_discard(sbi) &&
 				f2fs_test_and_clear_bit(offset + i, se->discard_map))
-			atomic_add(1, &sbi->discard_blks);	/* DeLFS: atomic counter */
+			this_cpu_inc(sbi->pcpu_cnt->discard_blks);	/* DeLFS: per CPU */
 
 		if (!f2fs_test_bit(offset + i, se->ckpt_valid_map)) {
 			se->ckpt_valid_blocks -= 1;
@@ -2827,7 +2827,7 @@ static int update_sit_entry_for_alloc(struct f2fs_sb_info *sbi, struct seg_entry
 
 	if (f2fs_block_unit_discard(sbi) &&
 			!f2fs_test_and_set_bit(offset, se->discard_map))
-		atomic_sub(1, &sbi->discard_blks);	/* DeLFS: atomic counter */
+		this_cpu_dec(sbi->pcpu_cnt->discard_blks);	/* DeLFS: per CPU */
 
 	/*
 	 * SSR should never reuse block which is checkpointed
@@ -2882,8 +2882,12 @@ void update_sit_entry(struct f2fs_sb_info *sbi, block_t blkaddr, int del)
 
 	__mark_sit_entry_dirty(sbi, segno);
 
-	/* update total number of valid blocks to be written in ckpt area */
-	atomic64_add(del, &SIT_I(sbi)->written_valid_blocks);	/* DeLFS */
+	/*
+	 * update total number of valid blocks to be written in ckpt area.
+	 * DeLFS: on this CPU's counter; every block allocated or invalidated
+	 * on any core comes here (see written_block_count()).
+	 */
+	this_cpu_add(sbi->pcpu_cnt->written_valid_blocks, del);
 
 	if (__is_large_section(sbi))
 		get_sec_entry(sbi, segno)->valid_blocks += del;
@@ -3507,11 +3511,12 @@ static int get_atssr_segment(struct f2fs_sb_info *sbi, int type,
 static int __f2fs_init_atgc_curseg(struct f2fs_sb_info *sbi, bool force)
 {
 	int cpu, ret = 0;
+	int lock_cpu;
 
 	if (!sbi->am.atgc_enabled && !force)
 		return 0;
 
-	f2fs_down_read(&SM_I(sbi)->curseg_lock);
+	f2fs_pcpu_down_read(&SM_I(sbi)->curseg_lock, &lock_cpu);
 
 	for_each_online_cpu(cpu) {
 		struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
@@ -3531,7 +3536,7 @@ static int __f2fs_init_atgc_curseg(struct f2fs_sb_info *sbi, bool force)
 			break;
 	}
 
-	f2fs_up_read(&SM_I(sbi)->curseg_lock);
+	f2fs_pcpu_up_read(&SM_I(sbi)->curseg_lock, lock_cpu);
 	return ret;
 }
 
@@ -3700,8 +3705,9 @@ int f2fs_allocate_segment_for_resize(struct f2fs_sb_info *sbi, int type,
 					unsigned int start, unsigned int end)
 {
 	int cpu, ret = 0;
+	int lock_cpu;
 
-	f2fs_down_read(&SM_I(sbi)->curseg_lock);
+	f2fs_pcpu_down_read(&SM_I(sbi)->curseg_lock, &lock_cpu);
 
 	for_each_online_cpu(cpu) {
 		struct curseg_info_array *cpu_array = WRAP_CURSEG_I(sbi, cpu);
@@ -3737,7 +3743,7 @@ unlock:
 			break;
 	}
 
-	f2fs_up_read(&SM_I(sbi)->curseg_lock);
+	f2fs_pcpu_up_read(&SM_I(sbi)->curseg_lock, lock_cpu);
 	return ret;
 }
 
@@ -3785,11 +3791,12 @@ static int __allocate_new_segment(struct f2fs_sb_info *sbi, int type,
 int f2fs_allocate_new_section(struct f2fs_sb_info *sbi, int type, bool force)
 {
 	int ret;
+	int lock_cpu;
 
 	/* DeLFS (B): no SIT lock here, as in DeLFS 6.6.8 */
-	f2fs_down_read(&SM_I(sbi)->curseg_lock);
+	f2fs_pcpu_down_read(&SM_I(sbi)->curseg_lock, &lock_cpu);
 	ret = __allocate_new_segment(sbi, type, true, force);
-	f2fs_up_read(&SM_I(sbi)->curseg_lock);
+	f2fs_pcpu_up_read(&SM_I(sbi)->curseg_lock, lock_cpu);
 
 	return ret;
 }
@@ -3824,8 +3831,9 @@ int f2fs_allocate_new_segments(struct f2fs_sb_info *sbi)
 {
 	int i, cpu;
 	int err = 0;
+	int lock_cpu;
 
-	f2fs_down_read(&SM_I(sbi)->curseg_lock);
+	f2fs_pcpu_down_read(&SM_I(sbi)->curseg_lock, &lock_cpu);
 	/* DeLFS (B): every core's SIT lock (DDL exception, recovery only) */
 	f2fs_down_write_all_sentry_locks(sbi);
 	/* DeLFS: every online core's data cursegs */
@@ -3833,7 +3841,7 @@ int f2fs_allocate_new_segments(struct f2fs_sb_info *sbi)
 		for (i = CURSEG_HOT_DATA; i <= CURSEG_COLD_DATA; i++)
 			err += __allocate_new_segment_cpu(sbi, i, false, false, cpu);
 	f2fs_up_write_all_sentry_locks(sbi);
-	f2fs_up_read(&SM_I(sbi)->curseg_lock);
+	f2fs_pcpu_up_read(&SM_I(sbi)->curseg_lock, lock_cpu);
 
 	return err;
 }
@@ -3963,7 +3971,7 @@ int f2fs_trim_fs(struct f2fs_sb_info *sbi, struct fstrim_range *range)
 	cpc.trim_start = start_segno;
 	cpc.trim_end = end_segno;
 
-	if (atomic_read(&sbi->discard_blks) == 0)
+	if (!f2fs_discard_blks(sbi))
 		goto out;
 
 	f2fs_down_write_trace(&sbi->gc_lock, &lc);
@@ -4340,10 +4348,11 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct folio *folio,
 	unsigned int old_segno, new_segno;
 	int sentry_cpu_old, sentry_cpu_new;
 	struct rw_semaphore *se_lock;
+	int lock_cpu;	/* DeLFS: whose curseg_lock semaphore we hold */
 	int ret = 0;
 
 	ktget(&stopwatch[0]);
-	f2fs_down_read(&SM_I(sbi)->curseg_lock);
+	f2fs_pcpu_down_read(&SM_I(sbi)->curseg_lock, &lock_cpu);
 	ktget(&stopwatch[1]);
 	ktput(stopwatch, if_2);
 
@@ -4533,13 +4542,13 @@ skip_new_segment:
 		spin_unlock(&io->io_lock);
 	}
 
-	f2fs_up_read(&SM_I(sbi)->curseg_lock);
+	f2fs_pcpu_up_read(&SM_I(sbi)->curseg_lock, lock_cpu);
 	return 0;
 
 out_err:
 	*new_blkaddr = NULL_ADDR;
 	mutex_unlock(&curseg->curseg_mutex);
-	f2fs_up_read(&SM_I(sbi)->curseg_lock);
+	f2fs_pcpu_up_read(&SM_I(sbi)->curseg_lock, lock_cpu);
 	return ret;
 }
 
@@ -4794,7 +4803,7 @@ void f2fs_do_replace_block(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 	se = get_seg_entry(sbi, segno);
 	type = se->type;
 
-	f2fs_down_write(&SM_I(sbi)->curseg_lock);
+	f2fs_pcpu_down_write(&SM_I(sbi)->curseg_lock, NULL);
 
 	if (!recover_curseg) {
 		/* for recovery flow */
@@ -4869,7 +4878,7 @@ void f2fs_do_replace_block(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 out_unlock:
 	f2fs_up_write_all_sentry_locks(sbi);
 	mutex_unlock(&curseg->curseg_mutex);
-	f2fs_up_write(&SM_I(sbi)->curseg_lock);
+	f2fs_pcpu_up_write(&SM_I(sbi)->curseg_lock);
 }
 
 void f2fs_replace_block(struct f2fs_sb_info *sbi, struct dnode_of_data *dn,
@@ -6299,12 +6308,14 @@ static int do_fix_curseg_write_pointer(struct f2fs_sb_info *sbi, int type,
 	    cs->segno != GET_SEG_FROM_SEC(sbi, GET_ZONE_FROM_SEC(sbi, cs_section))) {
 		unsigned int old_segno = cs->segno, old_blkoff = cs->next_blkoff;
 
-		f2fs_down_read(&SM_I(sbi)->curseg_lock);
+		int lock_cpu;
+
+		f2fs_pcpu_down_read(&SM_I(sbi)->curseg_lock, &lock_cpu);
 		/* DeLFS (B): no global sentry_lock; zoned only (rare path) */
 		f2fs_down_write_all_sentry_locks(sbi);
 		__allocate_new_segment_cpu(sbi, type, true, true, cpu);
 		f2fs_up_write_all_sentry_locks(sbi);
-		f2fs_up_read(&SM_I(sbi)->curseg_lock);
+		f2fs_pcpu_up_read(&SM_I(sbi)->curseg_lock, lock_cpu);
 		f2fs_notice(sbi, "Assign new section to curseg[%d]: "
 				"[0x%x,0x%x] -> [0x%x,0x%x]",
 				type, old_segno, old_blkoff,
@@ -6585,7 +6596,10 @@ int f2fs_build_segment_manager(struct f2fs_sb_info *sbi)
 
 	INIT_LIST_HEAD(&sm_info->sit_entry_set);
 
-	init_f2fs_rwsem(&sm_info->curseg_lock);
+	/* DeLFS: per-CPU semaphore, freed in f2fs_destroy_segment_manager() */
+	err = init_f2fs_pcpu_rwsem(&sm_info->curseg_lock, NULL, LOCK_NAME_NONE);
+	if (err)
+		return err;
 
 	err = f2fs_create_flush_cmd_control(sbi);
 	if (err)
@@ -6757,6 +6771,7 @@ void f2fs_destroy_segment_manager(struct f2fs_sb_info *sbi)
 	destroy_free_segmap(sbi);
 	destroy_sit_info(sbi);
 	sbi->sm_info = NULL;
+	free_percpu(sm_info->curseg_lock.sem);
 	kfree(sm_info);
 }
 

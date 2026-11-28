@@ -1260,13 +1260,12 @@ struct f2fs_sm_info {
 	struct curseg_info_array __percpu *wrap_curseg_array;	/* DeLFS: per-core active segment information */
 
 	/*
-	 * DeLFS: every block allocation read-locks this, on all cores at once,
-	 * so its lock word changes all the time. It gets a cache line of its
-	 * own: the pointers above and the geometry below are only read on the
-	 * same path, and sharing a line with the lock made each of those reads
-	 * a cache miss on the other cores (false sharing).
+	 * DeLFS: every block allocation read-locks this, on all cores at once.
+	 * It is a per-CPU semaphore (see struct f2fs_pcpu_rwsem), so a reader
+	 * writes only the semaphore of its own CPU; what is stored here is
+	 * read-mostly, like the pointers above.
 	 */
-	struct f2fs_rwsem curseg_lock ____cacheline_aligned_in_smp;	/* for preventing curseg change */
+	struct f2fs_pcpu_rwsem curseg_lock;	/* for preventing curseg change */
 
 	block_t seg0_blkaddr ____cacheline_aligned_in_smp;	/* block address of 0'th segment */
 	block_t main_blkaddr;		/* start block address of main area */
@@ -1353,6 +1352,16 @@ struct f2fs_pcpu_cnt {
 	long nr_pages[NR_F2FS_PCPU_PAGES];
 	/* data blocks allocated while the block-age extent cache is off */
 	unsigned long long allocated_data_blocks;
+	/*
+	 * Changes made on this CPU to two counters that update_sit_entry()
+	 * adjusts for every block allocated or invalidated.  The fs-wide
+	 * value is the base (sit_i->written_valid_blocks, sbi->discard_blks,
+	 * set while the SIT is built at mount) plus these.
+	 */
+	long long written_valid_blocks;
+	long discard_blks;
+	/* statistics: blocks allocated per alloc_type (LFS, SSR) */
+	unsigned long block_count[2];
 };
 
 /*
@@ -2097,7 +2106,7 @@ struct f2fs_sb_info {
 	struct f2fs_stat_info *stat_info;	/* FS status information */
 	atomic_t meta_count[META_MAX];		/* # of meta blocks */
 	unsigned int segment_count[2];		/* # of allocated segments */
-	unsigned int block_count[2];		/* # of allocated blocks */
+	/* DeLFS: # of allocated blocks is counted per CPU, see f2fs_pcpu_cnt */
 	atomic_t inplace_count;		/* # of inplace update */
 	/* # of lookup extent cache */
 	atomic64_t total_hit_ext[NR_EXTENT_CACHES];
@@ -2668,6 +2677,27 @@ void f2fs_pcpu_down_write(struct f2fs_pcpu_rwsem *ps,
 						struct f2fs_rwsem *nest_lock);
 void f2fs_pcpu_up_write(struct f2fs_pcpu_rwsem *ps);
 bool f2fs_pcpu_rwsem_is_locked(struct f2fs_pcpu_rwsem *ps);
+/* readers without a lock context keep the CPU themselves */
+void f2fs_pcpu_down_read(struct f2fs_pcpu_rwsem *ps, int *cpu);
+void f2fs_pcpu_up_read(struct f2fs_pcpu_rwsem *ps, int cpu);
+
+/*
+ * One f2fs_rwsem per possible CPU.  A macro, so that each lock gets the lock
+ * class of its own call site, as init_f2fs_rwsem_trace() does for a single
+ * semaphore.  Evaluates to 0 or -ENOMEM; free with free_percpu((ps)->sem).
+ */
+#define init_f2fs_pcpu_rwsem(ps, sbi, name)				\
+({									\
+	int __cpu;							\
+									\
+	atomic_set(&(ps)->writers, 0);					\
+	(ps)->sem = alloc_percpu(struct f2fs_rwsem);			\
+	if ((ps)->sem)							\
+		for_each_possible_cpu(__cpu)				\
+			init_f2fs_rwsem_trace(per_cpu_ptr((ps)->sem,	\
+						__cpu), sbi, name);	\
+	(ps)->sem ? 0 : -ENOMEM;					\
+})
 
 static inline void disable_nat_bits(struct f2fs_sb_info *sbi, bool lock)
 {
@@ -2981,6 +3011,9 @@ static inline int f2fs_pcpu_page_type(struct f2fs_sb_info *sbi, int count_type)
 
 s64 f2fs_pcpu_pages_sum(struct f2fs_sb_info *sbi, int type);
 unsigned long long f2fs_allocated_data_blocks(struct f2fs_sb_info *sbi);
+block_t f2fs_written_block_count(struct f2fs_sb_info *sbi);
+block_t f2fs_discard_blks(struct f2fs_sb_info *sbi);
+unsigned long f2fs_stat_block_count(struct f2fs_sb_info *sbi, int alloc_type);
 
 static inline void inc_page_count(struct f2fs_sb_info *sbi, int count_type)
 {
@@ -3097,7 +3130,7 @@ static inline block_t valid_user_blocks(struct f2fs_sb_info *sbi)
 
 static inline block_t discard_blocks(struct f2fs_sb_info *sbi)
 {
-	return (block_t)atomic_read(&sbi->discard_blks);
+	return f2fs_discard_blks(sbi);
 }
 
 static inline unsigned long __bitmap_size(struct f2fs_sb_info *sbi, int flag)
@@ -4704,8 +4737,9 @@ static inline struct f2fs_stat_info *F2FS_STAT(struct f2fs_sb_info *sbi)
 	} while (0)
 #define stat_inc_seg_type(sbi, curseg)					\
 		((sbi)->segment_count[(curseg)->alloc_type]++)
+/* DeLFS: counted per CPU, every block allocation of every core comes here */
 #define stat_inc_block_count(sbi, curseg)				\
-		((sbi)->block_count[(curseg)->alloc_type]++)
+	this_cpu_inc((sbi)->pcpu_cnt->block_count[(curseg)->alloc_type])
 #define stat_inc_inplace_blocks(sbi)					\
 		(atomic_inc(&(sbi)->inplace_count))
 #define stat_update_max_atomic_write(inode)				\

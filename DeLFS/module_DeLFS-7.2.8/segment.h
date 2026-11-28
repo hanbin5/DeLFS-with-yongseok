@@ -664,7 +664,8 @@ static inline void get_sit_bitmap(struct f2fs_sb_info *sbi,
 
 static inline block_t written_block_count(struct f2fs_sb_info *sbi)
 {
-	return (block_t)atomic64_read(&SIT_I(sbi)->written_valid_blocks);
+	/* DeLFS: base + per-CPU changes, see struct f2fs_pcpu_cnt */
+	return f2fs_written_block_count(sbi);
 }
 
 static inline unsigned int free_segments(struct f2fs_sb_info *sbi)
