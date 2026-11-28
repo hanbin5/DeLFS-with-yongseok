@@ -21,6 +21,7 @@
 #include <linux/cgroup.h>
 #include <linux/fs.h>
 #include <linux/jiffies.h>
+#include <linux/pagemap.h>
 #include <linux/percpu.h>
 #include <linux/rcupdate.h>
 #include <linux/spinlock.h>
@@ -199,8 +200,45 @@ static long df_wb_writeback(struct bdi_writeback *wb,
  * nr_threads is 0, and the dec/clear vs inc/set pair must be made atomic
  * (e.g. under a lock).
  */
-static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages,
-				       bool *over)
+/*
+ * DeLFS: write back the caller's own file first.
+ *
+ * df_wb_writeback() takes whatever inode is next on the wb's list, which is
+ * almost never the file the calling thread writes to.  So while thread A
+ * writes file 1, some thread B writes back file 1's pages: the two fight over
+ * that file's page-cache tree lock, its node pages and its inode counters,
+ * page by page, and A does the same to somebody else's file.  Starting with
+ * the caller's own file keeps each file on one CPU: the thread either
+ * dirties it or cleans it.  It also makes the writer that dirtied the pages
+ * the one that cleans them.
+ *
+ * The same ->writepages() the flusher would call, without taking the inode
+ * off the wb lists (as fsync does): if the flusher or another dflush thread
+ * works on this inode at the same time, the folio locks sort it out.  The
+ * inode stays on the dirty list until the flusher finds it clean.
+ */
+static long df_write_own_file(struct address_space *mapping, long nr_pages)
+{
+	struct writeback_control wbc = {
+		.sync_mode	= WB_SYNC_NONE,
+		.nr_to_write	= nr_pages,
+		.range_cyclic	= 1,
+		.for_background	= 1,
+	};
+
+	if (!mapping_tagged(mapping, PAGECACHE_TAG_DIRTY))
+		return 0;
+
+	wbc_attach_fdatawrite_inode(&wbc, mapping->host);
+	mapping->a_ops->writepages(mapping, &wbc);
+	wbc_detach_inode(&wbc);
+
+	return nr_pages - wbc.nr_to_write;
+}
+
+static long df_wb_do_writeback_limited(struct bdi_writeback *wb,
+				       struct address_space *mapping,
+				       long nr_pages, bool *over)
 {
 	long wrote = 0;
 
@@ -228,7 +266,22 @@ static long df_wb_do_writeback_limited(struct bdi_writeback *wb, long nr_pages,
 		 * write() pay two clock-read pairs the original does not.
 		 */
 		ktget(&stopwatch[0]);
-		wrote += df_wb_writeback(wb, &work);
+		/*
+		 * Own file first; what is left of the 64MB goes to the other
+		 * inodes of the wb as before (df_wb_writeback() stops by
+		 * itself once the wb is below the threshold again).
+		 */
+		wrote = df_write_own_file(mapping, nr_pages);
+		/*
+		 * The cyclic scan of ->writepages() ends at the end of the
+		 * file without wrapping: once more, from the start.
+		 */
+		if (wrote < nr_pages)
+			wrote += df_write_own_file(mapping, nr_pages - wrote);
+		if (wrote < nr_pages) {
+			work.nr_pages = nr_pages - wrote;
+			wrote += df_wb_writeback(wb, &work);
+		}
 		ktget(&stopwatch[1]);
 		ktput(stopwatch, df_wb_check_background_flush);
 	}
@@ -440,8 +493,8 @@ long df_flush_deferred_writeback(struct address_space *mapping, size_t bytes)
 		wb = &bdi->wb;
 
 	/* not timed per poll: see df_wb_do_writeback_limited() */
-	wrote = df_wb_do_writeback_limited(wb, DF_DEFERRED_WRITEBACK_PAGES,
-					   &over);
+	wrote = df_wb_do_writeback_limited(wb, mapping,
+					   DF_DEFERRED_WRITEBACK_PAGES, &over);
 
 	/*
 	 * Cache only a "below" result.  After writeback the wb may be below
