@@ -2,10 +2,12 @@
 
 작성 2026-11-28 (오전 측정과 오후 후속 측정을 합친 기록). `DeLFS-성능실험-계획과-다음할일.md`의 "7.2 코드: 성능 — 남은 병목 후보"를 이어서 진행한 것임.
 
-- 브랜치 (GitHub `origin`에 올림, PR 없음, 2026-11-28)
-  - `perf/b-next`: 패치 1~6. 기준은 `perf/delfs-7.2.8-parity` 끝 커밋 `4b54aa1d6`
-  - `perf/b-next-all`: 위 + 팀 dflush 캐시 커밋(`52148ed80`) + dflush 수정안 2개. 전부 합친 것
-  - 이 문서와 그래프 2장은 두 브랜치의 `env-guide/perf-1128-percpu/`에 같이 넣었음
+- 브랜치: GitHub `origin`의 `perf/b-next` 하나 (PR 없음, 2026-11-28). 기준은 `perf/delfs-7.2.8-parity` 끝 커밋 `4b54aa1d6`
+  - 커밋 `2428623bb`까지: debugfs 수정 + 패치 1~6 + 이 문서 첫 판. dflush 동작은 그대로임. 서버 빌드 bn6와 같은 코드
+  - 그 뒤 dflush 커밋 3개: 팀 dflush 캐시(`52148ed80`을 옮겨 온 `8b9a9237c`) + 수정안 2개(`150932f8d`, `9fbdd54ae`). 끝까지가 전부 합친 것이고, 서버 빌드 bn6d와 같은 코드
+  - 처음에는 `perf/b-next`(패치 1~6)와 `perf/b-next-all`(전부) 두 브랜치로 올렸다가, 같은 날 하나로 합치고 `perf/b-next-all`은 GitHub에서 지웠음
+  - 본문의 dflush 커밋 번호는 처음 작업할 때 번호임. GitHub에서는 `d48f39a8c` → `8b9a9237c`, `fa91c1759` → `150932f8d`, `8c304b1fe` → `9fbdd54ae`이고, bn6d(`da97f2c4e`)는 `perf/b-next` 끝과 코드가 같음
+  - 이 문서와 그래프 2장은 `env-guide/perf-1128-percpu/`에 있음
 - 서버 측정 원본: `/home/linux/delfs-port-728/runs/k728-bn-*`(오전), `k728-bn2-*`, `k728-bn3-*`(오후)
 - 작성자 PC 사본: `~/delfs/build/perf/lab-1128b/`(오전), `~/delfs/build/perf/lab-1128c/`(오후). `~/delfs/...` 경로, 버그 목록(`DeLFS-버그목록.md`), 계획 문서는 작성자 PC에만 있음
 
@@ -721,7 +723,7 @@ fio 128 jobs로 본 손해 여부 (큐 3, 2회, MiB/s)
 
 ### 9.1 주의할 점
 
-- **GitHub에 올린 것은 두 브랜치뿐임(PR 없음):** `perf/b-next`(패치 1~6), `perf/b-next-all`(전부 합친 것). dflush 단계별 브랜치(`perf/b-next-dflush`, `-dflush2`, `-dflush3`)와 기각된 실험 `perf/b-next-dflush-jit`은 작성자 PC에만 있음. 단계별 브랜치의 커밋은 `perf/b-next-all` 안에 차례로 들어 있음(`d48f39a8c`, `fa91c1759`, `8c304b1fe`).
+- **GitHub에 올린 것은 `perf/b-next` 하나임(PR 없음).** `2428623bb`까지가 패치 1~6(bn6), 끝까지가 전부(bn6d)임. dflush를 빼고 쓰려면 `2428623bb`까지만 가져가면 됨. `perf/b-next-all`, dflush 단계별 브랜치(`perf/b-next-dflush`, `-dflush2`, `-dflush3`), 기각된 실험 `perf/b-next-dflush-jit`은 작성자 PC에만 있음.
 - **락 구조를 바꾼 패치(4, 5)는 팀 검토가 필요함.** 원본에 없는 변경임(캐시 라인 분리 커밋과 같은 성격).
   - lockdep: `cp_rwsem`, `node_change`는 `cp_global_sem`을 nest lock으로 넘겼음. `curseg_lock`은 그런 바깥 락이 없어서, lockdep을 켠 커널에서는 코어별 락 클래스를 따로 만들어야 함(하지 않았음. 지금 커널은 lockdep이 꺼져 있음).
   - 메모리: 마운트마다 코어당 `f2fs_rwsem` 3개(144바이트)와 카운터 64바이트를 더 씀.
@@ -760,8 +762,8 @@ fio 128 jobs로 본 손해 여부 (큐 3, 2회, MiB/s)
 
 | 무엇 | 어디 |
 |---|---|
-| 패치 브랜치 | GitHub: `perf/b-next`, `perf/b-next-all`. 작성자 PC 작업 폴더: `~/delfs/perf-next` (`perf/b-next`), `~/delfs/perf-next-d` (`perf/b-next-all`, PC에만 있는 `-dflush`, `-dflush2`, `-dflush3`, 기각된 실험 `-dflush-jit`) |
-| 이 문서 (저장소) | 두 브랜치의 `env-guide/perf-1128-percpu/README.md`, 그래프 `fio128.svg`, `fileserver.svg` |
+| 패치 브랜치 | GitHub: `perf/b-next` (`2428623bb`까지 = 패치 1~6, 끝까지 = 전부). 작성자 PC 작업 폴더: `~/delfs/perf-next` (`perf/b-next`), `~/delfs/perf-next-d` (PC에만 있는 `perf/b-next-all`, `-dflush`, `-dflush2`, `-dflush3`, 기각된 실험 `-dflush-jit`) |
+| 이 문서 (저장소) | `perf/b-next`의 `env-guide/perf-1128-percpu/README.md`, 그래프 `fio128.svg`, `fileserver.svg` |
 | 패치 파일 묶음 | `~/delfs/build/perf/lab-1128c/patches/b-next/`(7개), `patches/dflush/`(2개) |
 | 로컬 빌드 | `~/delfs/build/perf/{n1,n2,n3,n4,n4d,n4d2,n5d,n6,n6d,n4dj,n4dh,dflush1,parity}/delfs.ko` |
 | 서버 소스·빌드 | `/home/linux/delfs-port-728/src/port-bn*`, `build/mod-7.2.8/port-bn*-off/` |
