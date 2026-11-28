@@ -2244,12 +2244,22 @@ static inline void f2fs_update_time(struct f2fs_sb_info *sbi, int type)
 {
 	unsigned long now = jiffies;
 
-	WRITE_ONCE(sbi->last_time[type], now);
+	/*
+	 * DeLFS: every buffered write ends with f2fs_update_time(REQ_TIME).
+	 * Storing a value that is already there still takes the cache line
+	 * exclusive, so with many writer threads the line (last_time[] and
+	 * interval_time[]) moves from core to core once per write for nothing.
+	 * Store only when the value changes, i.e. about once per jiffy.
+	 */
+	if (READ_ONCE(sbi->last_time[type]) != now)
+		WRITE_ONCE(sbi->last_time[type], now);
 
 	/* DISCARD_TIME and GC_TIME are based on REQ_TIME */
 	if (type == REQ_TIME) {
-		WRITE_ONCE(sbi->last_time[DISCARD_TIME], now);
-		WRITE_ONCE(sbi->last_time[GC_TIME], now);
+		if (READ_ONCE(sbi->last_time[DISCARD_TIME]) != now)
+			WRITE_ONCE(sbi->last_time[DISCARD_TIME], now);
+		if (READ_ONCE(sbi->last_time[GC_TIME]) != now)
+			WRITE_ONCE(sbi->last_time[GC_TIME], now);
 	}
 }
 
