@@ -2874,11 +2874,21 @@ static inline void inc_page_count(struct f2fs_sb_info *sbi, int count_type)
 {
 	atomic_inc(&sbi->nr_pages[count_type]);
 
-	if (count_type == F2FS_DIRTY_DENTS ||
+	/*
+	 * DeLFS: set_bit() writes s_flag even when the bit is already set,
+	 * and s_flag shares its cache line with fields the write path only
+	 * reads (s_flag itself, oldinv).  Test first, so that a filesystem
+	 * that is already dirty does not take that line exclusive for every
+	 * node, meta or inode page that gets dirty.  The count is raised
+	 * before the test, so a checkpoint that clears the flag afterwards
+	 * still sees the page in its re-check of the dirty counts.
+	 */
+	if ((count_type == F2FS_DIRTY_DENTS ||
 			count_type == F2FS_DIRTY_NODES ||
 			count_type == F2FS_DIRTY_META ||
 			count_type == F2FS_DIRTY_QDATA ||
-			count_type == F2FS_DIRTY_IMETA)
+			count_type == F2FS_DIRTY_IMETA) &&
+			!is_sbi_flag_set(sbi, SBI_IS_DIRTY))
 		set_sbi_flag(sbi, SBI_IS_DIRTY);
 }
 
