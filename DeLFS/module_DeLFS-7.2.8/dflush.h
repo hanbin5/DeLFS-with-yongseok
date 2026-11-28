@@ -39,6 +39,6 @@ ssize_t df_generic_perform_write(struct kiocb *iocb, struct iov_iter *i);
 int df_balance_dirty_pages_ratelimited_async(struct address_space *mapping);
 
 /* fs/fs-writeback.c */
-long df_flush_deferred_writeback(struct address_space *mapping);
+long df_flush_deferred_writeback(struct address_space *mapping, size_t bytes);
 
 #endif /* _DELFS_DFLUSH_H */

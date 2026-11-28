@@ -291,8 +291,58 @@ struct df_bg_key {
 struct df_bg_below_cache {
 	struct df_bg_key	key;
 	unsigned long		stamp;	/* jiffies of the "below" check */
+	/* pages written through this CPU, see df_cpu_is_light() */
+	unsigned long		win;		/* the jiffy win_pages is for */
+	unsigned int		win_pages;
+	unsigned int		prev_pages;	/* the jiffy before, or 0 */
 };
 static DEFINE_PER_CPU(struct df_bg_below_cache, df_bg_below_cache);
+
+/*
+ * DeLFS: a CPU that hardly dirties anything does not do the writeback.
+ *
+ * Whoever finds the wb over the background threshold writes back up to
+ * 64MB, whatever it dirtied itself.  Without the cache above that was close
+ * to fair: every write() checked, the wb was brought back below within
+ * microseconds of crossing, and almost always by the threads that write all
+ * the time.  With the cache the heavy writers look again only at the next
+ * jiffy, so the wb stays over for milliseconds, and a thread that writes
+ * now and then walks into nearly every one of those windows and gets the
+ * 64MB.  Measured in a 16-vCPU VM (8 fio 4K random writers plus one process
+ * writing 4 KiB every 2 ms, build/perf/smallwrite-test.sh): that process
+ * spent 9.5 of 15 s inside write() with the cache (single calls up to
+ * 2.3 s), 0.4 s without it.
+ *
+ * So the pages written through each CPU are counted per jiffy, and a CPU
+ * that wrote fewer than DF_LIGHT_PAGES in the current and the previous jiffy
+ * returns before the check: it has not caused the dirty pages and it is not
+ * the one to brake.  The kernel's own throttling has the same notion (a task
+ * below its ratelimit never enters balance_dirty_pages()).  Counting per CPU
+ * rather than per task also catches many small writers on one CPU.  A heavy
+ * writer comes back from a long writeback with an empty count and gets
+ * DF_LIGHT_PAGES pages for free; that is nothing next to the 64MB it wrote.
+ *
+ * The bound on what can stay unbraked is DF_LIGHT_PAGES per two jiffies and
+ * CPU (about 4MB/s per CPU at HZ=250); the flusher still runs for that.
+ */
+#define DF_LIGHT_PAGES	max(2, 2000 / HZ)	/* 8 pages at HZ=250 */
+
+/* account @pages to this CPU; true if it wrote too little to be braked */
+static inline bool df_cpu_is_light(struct df_bg_below_cache *c,
+				   unsigned long pages)
+{
+	unsigned long now = jiffies;
+
+	if (c->win != now) {
+		c->prev_pages = (c->win + 1 == now) ? c->win_pages : 0;
+		c->win = now;
+		c->win_pages = 0;
+	}
+	if (c->win_pages < DF_LIGHT_PAGES)
+		c->win_pages += min_t(unsigned long, pages, DF_LIGHT_PAGES);
+
+	return c->win_pages + c->prev_pages < DF_LIGHT_PAGES;
+}
 
 static inline void df_bg_key_init(struct df_bg_key *key,
 				  struct backing_dev_info *bdi, bool cgwb)
@@ -311,7 +361,9 @@ static inline void df_bg_key_init(struct df_bg_key *key,
 #endif
 }
 
-static inline bool df_bg_below_cached(const struct df_bg_key *key)
+/* true if this write() needs no check: light CPU, or a fresh "below" result */
+static inline bool df_bg_below_cached(const struct df_bg_key *key,
+				      unsigned long pages)
 {
 	struct df_bg_below_cache *c;
 	bool hit;
@@ -320,10 +372,11 @@ static inline bool df_bg_below_cached(const struct df_bg_key *key)
 		return false;
 
 	c = get_cpu_ptr(&df_bg_below_cache);
-	hit = c->key.bdi == key->bdi &&
-	      c->key.memcg_css == key->memcg_css &&
-	      c->key.blkcg_css == key->blkcg_css &&
-	      time_before(jiffies, c->stamp + DF_BG_BELOW_CACHE_JIFFIES);
+	hit = df_cpu_is_light(c, pages) ||
+	      (c->key.bdi == key->bdi &&
+	       c->key.memcg_css == key->memcg_css &&
+	       c->key.blkcg_css == key->blkcg_css &&
+	       time_before(jiffies, c->stamp + DF_BG_BELOW_CACHE_JIFFIES));
 	put_cpu_ptr(&df_bg_below_cache);
 	return hit;
 }
@@ -352,7 +405,7 @@ static inline void df_bg_below_store(const struct df_bg_key *key,
  */
 KTDEC(df_wb_do_writeback);
 
-long df_flush_deferred_writeback(struct address_space *mapping)
+long df_flush_deferred_writeback(struct address_space *mapping, size_t bytes)
 {
 	struct inode *inode;
 	struct backing_dev_info *bdi;
@@ -376,8 +429,8 @@ long df_flush_deferred_writeback(struct address_space *mapping)
 	cgwb = inode_cgwb_enabled(inode);
 	df_bg_key_init(&key, bdi, cgwb);
 
-	/* fast path: recently below the background threshold */
-	if (df_bg_below_cached(&key))
+	/* fast path: a light CPU, or recently below the background threshold */
+	if (df_bg_below_cached(&key, DIV_ROUND_UP(bytes, PAGE_SIZE)))
 		return 0;
 
 	stamp = jiffies;

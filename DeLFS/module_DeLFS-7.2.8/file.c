@@ -5522,7 +5522,7 @@ out_unlock:
 	 * fs/fs-writeback.c.
 	 */
 	if (ret > 0 && !(iocb->ki_flags & IOCB_NOWAIT))
-		df_flush_deferred_writeback(inode->i_mapping);
+		df_flush_deferred_writeback(inode->i_mapping, ret);
 out:
 	trace_f2fs_file_write_iter(inode, orig_pos, orig_count, ret);
 
