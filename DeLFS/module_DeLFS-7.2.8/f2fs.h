@@ -1299,6 +1299,36 @@ enum count_type {
 };
 
 /*
+ * DeLFS: per-CPU part of the fs-wide counters.
+ *
+ * Buffered I/O changes fs-wide page counts for every 4 KiB page:
+ * F2FS_DIRTY_DATA (+1 in write(), -1 in writeback), F2FS_WB_DATA (+1 at
+ * submit, -1 at end_io) and F2FS_RD_DATA (+1 at submit, -1 at end_io).
+ * As atomic_t in sbi->nr_pages[] they are one cache line that every core
+ * takes exclusive several times per page, so the line travels between all
+ * writers.  These three counts live here instead: a core changes only its
+ * own copy, and get_pages() adds the copies up.
+ *
+ * The sum is exact when no update is in flight.  That is enough for the
+ * readers of these three counts, which only check for zero or report
+ * (umount leak check, idle checks, disable-checkpoint flush, debugfs).
+ * The counts the write path itself reads for every page (dirty nodes,
+ * dentries and inode metadata in the free-space check) stay in nr_pages[].
+ */
+enum f2fs_pcpu_page_type {
+	F2FS_PCPU_DIRTY_DATA,
+	F2FS_PCPU_WB_DATA,
+	F2FS_PCPU_RD_DATA,
+	NR_F2FS_PCPU_PAGES,
+};
+
+struct f2fs_pcpu_cnt {
+	long nr_pages[NR_F2FS_PCPU_PAGES];
+	/* data blocks allocated while the block-age extent cache is off */
+	unsigned long long allocated_data_blocks;
+};
+
+/*
  * The below are the page types of bios used in submit_bio().
  * The available types are:
  * DATA			User data pages. It operates as async mode.
@@ -1909,7 +1939,15 @@ struct f2fs_sb_info {
 	 * counter keeps its meaning; it only gets a cache line of its own.
 	 */
 	atomic64_t allocated_data_blocks ____cacheline_aligned_in_smp;	/* for block age extent_cache */
-	unsigned int max_read_extent_count ____cacheline_aligned_in_smp;	/* max read extent count per inode */
+
+	/*
+	 * DeLFS: per-CPU counters (see struct f2fs_pcpu_cnt).  The pointer and
+	 * the flag are set at mount and only read afterwards, so they sit at
+	 * the start of the read-mostly units below.
+	 */
+	struct f2fs_pcpu_cnt __percpu *pcpu_cnt ____cacheline_aligned_in_smp;
+	bool pcpu_dirty_data;			/* F2FS_DIRTY_DATA is per CPU */
+	unsigned int max_read_extent_count;	/* max read extent count per inode */
 
 	/* The threshold used for hot and warm data seperation*/
 	unsigned int hot_data_age_threshold;
@@ -2870,8 +2908,44 @@ static inline void dec_valid_block_count(struct f2fs_sb_info *sbi,
 	f2fs_i_blocks_write(inode, count, false, true);
 }
 
+/*
+ * DeLFS: which per-CPU counter holds @count_type, or -1 if it is an atomic_t
+ * in sbi->nr_pages[].
+ *
+ * F2FS_DIRTY_DATA is per CPU only if the filesystem was not mounted in LFS
+ * mode: there the free-space check (__get_secs_required()) reads the count
+ * for every write, and adding up all CPUs each time would cost more than the
+ * shared atomic_t.  The choice is made once at mount (see init_percpu_info());
+ * if the mode is changed by remount the count stays where it is and
+ * get_pages() still returns the right value.
+ */
+static inline int f2fs_pcpu_page_type(struct f2fs_sb_info *sbi, int count_type)
+{
+	switch (count_type) {
+	case F2FS_DIRTY_DATA:
+		return sbi->pcpu_dirty_data ? F2FS_PCPU_DIRTY_DATA : -1;
+	case F2FS_WB_DATA:
+		return F2FS_PCPU_WB_DATA;
+	case F2FS_RD_DATA:
+		return F2FS_PCPU_RD_DATA;
+	default:
+		return -1;
+	}
+}
+
+s64 f2fs_pcpu_pages_sum(struct f2fs_sb_info *sbi, int type);
+unsigned long long f2fs_allocated_data_blocks(struct f2fs_sb_info *sbi);
+
 static inline void inc_page_count(struct f2fs_sb_info *sbi, int count_type)
 {
+	int type = f2fs_pcpu_page_type(sbi, count_type);
+
+	/* none of the per-CPU counts marks the filesystem dirty */
+	if (type >= 0) {
+		this_cpu_inc(sbi->pcpu_cnt->nr_pages[type]);
+		return;
+	}
+
 	atomic_inc(&sbi->nr_pages[count_type]);
 
 	/*
@@ -2903,6 +2977,14 @@ static inline void inode_inc_dirty_pages(struct inode *inode)
 
 static inline void dec_page_count(struct f2fs_sb_info *sbi, int count_type)
 {
+	int type = f2fs_pcpu_page_type(sbi, count_type);
+
+	/* may run on another CPU than the increment: only the sum counts */
+	if (type >= 0) {
+		this_cpu_dec(sbi->pcpu_cnt->nr_pages[type]);
+		return;
+	}
+
 	atomic_dec(&sbi->nr_pages[count_type]);
 }
 
@@ -2943,6 +3025,11 @@ static inline void release_atomic_write_cnt(struct inode *inode)
 
 static inline s64 get_pages(struct f2fs_sb_info *sbi, int count_type)
 {
+	int type = f2fs_pcpu_page_type(sbi, count_type);
+
+	if (type >= 0)
+		return f2fs_pcpu_pages_sum(sbi, type);
+
 	return atomic_read(&sbi->nr_pages[count_type]);
 }
 

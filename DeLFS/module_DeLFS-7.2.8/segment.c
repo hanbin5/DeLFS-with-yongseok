@@ -4436,11 +4436,24 @@ int f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct folio *folio,
 
 skip_new_segment:
 	if (IS_DATASEG(curseg->seg_type)) {
-		unsigned long long new_val;
+		/*
+		 * DeLFS: sbi->allocated_data_blocks is the clock of the
+		 * block-age extent cache; nothing else reads it but debugfs.
+		 * Without the age_extent_cache mount option (it cannot be
+		 * switched by remount) count on this CPU only, so that the
+		 * per-CPU logs do not all write one cache line for every data
+		 * block.  With the option, nothing changes.
+		 */
+		if (test_opt(sbi, AGE_EXTENT_CACHE)) {
+			unsigned long long new_val;
 
-		new_val = atomic64_inc_return(&sbi->allocated_data_blocks);
-		if (unlikely(new_val == ULLONG_MAX))
-			atomic64_set(&sbi->allocated_data_blocks, 0);
+			new_val = atomic64_inc_return(
+						&sbi->allocated_data_blocks);
+			if (unlikely(new_val == ULLONG_MAX))
+				atomic64_set(&sbi->allocated_data_blocks, 0);
+		} else {
+			this_cpu_inc(sbi->pcpu_cnt->allocated_data_blocks);
+		}
 	}
 
 	ktget(&stopwatch[0]);

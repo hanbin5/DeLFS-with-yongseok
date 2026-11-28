@@ -153,7 +153,7 @@ static void update_general_status(struct f2fs_sb_info *sbi)
 	si->hit_total[EX_READ] += si->hit_largest;
 
 	/* block age extent_cache only */
-	si->allocated_data_blocks = atomic64_read(&sbi->allocated_data_blocks);
+	si->allocated_data_blocks = f2fs_allocated_data_blocks(sbi);
 
 	/* validation check of the segment numbers */
 	si->ndirty_node = get_pages(sbi, F2FS_DIRTY_NODES);

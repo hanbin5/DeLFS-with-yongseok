@@ -1960,11 +1960,42 @@ static void f2fs_free_inode(struct inode *inode)
 	kmem_cache_free(f2fs_inode_cachep, F2FS_I(inode));
 }
 
+/*
+ * DeLFS: fs-wide value of a per-CPU page count (see struct f2fs_pcpu_cnt).
+ * All possible CPUs are added, so a CPU that went offline keeps its share.
+ * Updates running at the same time on other CPUs may or may not be seen; a
+ * decrement can be seen without its increment, so the sum is clamped at 0.
+ */
+s64 f2fs_pcpu_pages_sum(struct f2fs_sb_info *sbi, int type)
+{
+	s64 sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += READ_ONCE(per_cpu_ptr(sbi->pcpu_cnt, cpu)->nr_pages[type]);
+
+	return max_t(s64, sum, 0);
+}
+
+/* DeLFS: data blocks allocated since mount (block-age clock + per-CPU part) */
+unsigned long long f2fs_allocated_data_blocks(struct f2fs_sb_info *sbi)
+{
+	unsigned long long sum = atomic64_read(&sbi->allocated_data_blocks);
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += READ_ONCE(per_cpu_ptr(sbi->pcpu_cnt,
+					cpu)->allocated_data_blocks);
+	return sum;
+}
+
 static void destroy_percpu_info(struct f2fs_sb_info *sbi)
 {
 	percpu_counter_destroy(&sbi->total_valid_inode_count);
 	percpu_counter_destroy(&sbi->rf_node_block_count);
 	percpu_counter_destroy(&sbi->alloc_valid_block_count);
+	free_percpu(sbi->pcpu_cnt);
+	sbi->pcpu_cnt = NULL;
 }
 
 static void destroy_device_list(struct f2fs_sb_info *sbi)
@@ -4510,9 +4541,18 @@ static int init_percpu_info(struct f2fs_sb_info *sbi)
 {
 	int err;
 
+	/*
+	 * DeLFS: per-CPU counters, zeroed.  The mount options are already
+	 * applied here, and no data page is read or written before this.
+	 */
+	sbi->pcpu_cnt = alloc_percpu(struct f2fs_pcpu_cnt);
+	if (!sbi->pcpu_cnt)
+		return -ENOMEM;
+	sbi->pcpu_dirty_data = !f2fs_lfs_mode(sbi);
+
 	err = percpu_counter_init(&sbi->alloc_valid_block_count, 0, GFP_KERNEL);
 	if (err)
-		return err;
+		goto err_pcpu_cnt;
 
 	err = percpu_counter_init(&sbi->rf_node_block_count, 0, GFP_KERNEL);
 	if (err)
@@ -4528,6 +4568,9 @@ err_node_block:
 	percpu_counter_destroy(&sbi->rf_node_block_count);
 err_valid_block:
 	percpu_counter_destroy(&sbi->alloc_valid_block_count);
+err_pcpu_cnt:
+	free_percpu(sbi->pcpu_cnt);
+	sbi->pcpu_cnt = NULL;
 	return err;
 }
 
