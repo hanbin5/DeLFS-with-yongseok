@@ -1894,6 +1894,30 @@ int f2fs_inode_dirtied(struct inode *inode, bool sync)
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	int ret = 0;
 
+	/*
+	 * DeLFS: an inode that is already dirty (and, for @sync, already on
+	 * the dirty-meta list) needs no change here, so do not take the
+	 * fs-wide inode_lock[DIRTY_META] for it.
+	 *
+	 * Every write() that moves i_size comes here (f2fs_write_end() ->
+	 * f2fs_i_size_write() -> f2fs_mark_inode_dirty_sync()).  On 128 cores
+	 * (Filebench fileserver, 128 threads, RAM disk) 86% of all CPU time was
+	 * spent spinning on this lock.  Upstream and 6.6.8 DeLFS take it the
+	 * same way.
+	 *
+	 * Ordering against f2fs_inode_synced(), which clears this state and is
+	 * followed by the copy of the inode fields into the node page
+	 * (f2fs_update_inode()): our caller has stored its change before
+	 * calling us.  smp_mb() makes that store visible before we read the
+	 * state, and the clearing side has a full barrier after its
+	 * clear_bit().  So either we see the state cleared and take the lock
+	 * below, or the copy that follows the clear sees our caller's change.
+	 */
+	smp_mb();
+	if (is_inode_flag_set(inode, FI_DIRTY_INODE) &&
+	    (!sync || !data_race(list_empty(&F2FS_I(inode)->gdirty_list))))
+		return 1;
+
 	spin_lock(&sbi->inode_lock[DIRTY_META]);
 	if (is_inode_flag_set(inode, FI_DIRTY_INODE)) {
 		ret = 1;
@@ -1931,6 +1955,11 @@ void f2fs_inode_synced(struct inode *inode)
 	}
 	clear_inode_flag(inode, FI_DIRTY_INODE);
 	clear_inode_flag(inode, FI_AUTO_RECOVER);
+	/*
+	 * DeLFS: pairs with smp_mb() in f2fs_inode_dirtied().  The caller reads
+	 * the inode fields after this point (f2fs_update_inode()).
+	 */
+	smp_mb__after_atomic();
 	stat_dec_dirty_inode(F2FS_I_SB(inode), DIRTY_META);
 	spin_unlock(&sbi->inode_lock[DIRTY_META]);
 }
